@@ -1,13 +1,16 @@
-name: Build CatVod Spider JAR
+name: Build and Commit CatVod Spider JAR
 
 on:
+  # 在 Actions 页面手动运行
   workflow_dispatch:
+
+  # 源码或构建配置变更时自动运行
+  # 注意：故意不监听 jar/**，防止自动提交 JAR 后再次触发工作流。
   push:
     branches:
       - main
     paths:
       - "app/**"
-      - "jar/**"
       - "build.gradle"
       - "settings.gradle"
       - "gradle/**"
@@ -16,17 +19,23 @@ on:
       - ".github/workflows/build-jar.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: Build custom_spider.jar
+  build-and-commit:
+    name: Build and commit custom_spider.jar
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          # 必须检出当前分支，才能将 JAR 推送回 main
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          # 保留 GitHub Token，供后续 git push 使用
+          persist-credentials: true
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -44,11 +53,34 @@ jobs:
             throw "Build failed: jar\custom_spider.jar was not generated."
           }
 
-          Write-Host "Generated files:"
-          Get-ChildItem ".\jar\custom_spider.jar", ".\jar\custom_spider.jar.md5" |
+          if (-not (Test-Path ".\jar\custom_spider.jar.md5")) {
+            throw "Build failed: jar\custom_spider.jar.md5 was not generated."
+          }
+
+          Write-Host "Generated JAR:"
+          Get-ChildItem `
+            ".\jar\custom_spider.jar", `
+            ".\jar\custom_spider.jar.md5" |
             Select-Object Name, Length, LastWriteTime
 
-      - name: Upload generated JAR
+      - name: Commit generated JAR back to repository
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add jar/custom_spider.jar jar/custom_spider.jar.md5
+
+          $changes = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($changes)) {
+            Write-Host "JAR has not changed; no commit is needed."
+            exit 0
+          }
+
+          git commit -m "build: update custom_spider.jar [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: custom_spider-${{ github.run_number }}
