@@ -1,8 +1,8 @@
 package com.github.catvod.spider;
 
 import android.text.TextUtils;
-
 import com.github.catvod.bean.Vod;
+import com.github.catvod.crawler.SpiderDebug;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -24,10 +24,32 @@ import java.util.regex.Pattern;
  */
 final class YTParse {
 
-    private static final Pattern PLAYLIST_ID = Pattern.compile("[A-Za-z0-9_-]{10,}");
-    private static final Pattern BARE_PLAYLIST = Pattern.compile("(?:PL|UU|OLAK5uy|FL|LL|RD)[A-Za-z0-9_-]{8,}");
-    private static final Pattern DIGITS = Pattern.compile("[\\d,]+");
-    private static final Pattern UNSAFE_TITLE = Pattern.compile("[#$@%&!?*|\\\\/:<>]");
+    private static final Pattern NEVER = Pattern.compile("(?!x)x");
+
+    /**
+     * Compiles a pattern without letting a bad one abort class initialization.
+     *
+     * <p>Android's ICU regex engine is stricter than the desktop JDK engine, so a pattern that
+     * compiles during the build can still fail on device. A {@code PatternSyntaxException} thrown
+     * from a static field initializer surfaces as {@code ExceptionInInitializerError} and makes the
+     * whole class unloadable, which takes the spider down. Degrading to a never-matching pattern
+     * keeps the rest of the parser usable.
+     */
+    private static Pattern safePattern(String regex) {
+        try {
+            return Pattern.compile(regex);
+        } catch (Throwable e) {
+            SpiderDebug.log("YouTube 正则编译失败，该规则已停用: " + regex + " " + e);
+            return NEVER;
+        }
+    }
+
+    private static final Pattern PLAYLIST_ID = safePattern("[A-Za-z0-9_-]{10,}");
+    private static final Pattern BARE_PLAYLIST = safePattern("(?:PL|UU|OLAK5uy|FL|LL|RD)[A-Za-z0-9_-]{8,}");
+    private static final Pattern DIGITS = safePattern("[\\d,]+");
+    // The ampersand is escaped because ICU reads a bare `&&` inside a character class as an
+    // intersection operator.
+    private static final Pattern UNSAFE_TITLE = safePattern("[#$@%\\&!?*|\\\\/:<>]");
 
     private YTParse() {
     }

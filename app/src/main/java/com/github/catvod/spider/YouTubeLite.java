@@ -2,7 +2,7 @@ package com.github.catvod.spider;
 
 import android.net.Uri;
 import android.text.TextUtils;
-
+import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Json;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -32,14 +32,42 @@ class YouTubeLite {
 
     static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/** Matches nothing; stands in for a pattern that failed to compile. */
+    private static final Pattern NEVER = Pattern.compile("(?!x)x");
+
+    /**
+     * Compiles a pattern without letting a bad one abort class initialization.
+     *
+     * <p>A {@code PatternSyntaxException} thrown from a static field initializer surfaces as
+     * {@code ExceptionInInitializerError}, which makes the whole class unloadable and takes the
+     * spider down before {@code init} can return. Android's ICU engine is stricter than the
+     * desktop JDK engine (an unescaped closing brace is rejected, for one), so a pattern that
+     * compiles during a desktop build can still fail on device. Degrading to a never-matching
+     * pattern keeps the rest of the spider usable.
+     */
+    private static Pattern safePattern(String regex, int flags) {
+        try {
+            return Pattern.compile(regex, flags);
+        } catch (Throwable e) {
+            SpiderDebug.log("YouTube 正则编译失败，该规则已停用: " + regex + " " + e);
+            return NEVER;
+        }
+    }
+
+    private static Pattern safePattern(String regex) {
+        return safePattern(regex, 0);
+    }
+
 
     private static final Pattern RE_VIDEO_ID_URL =
-            Pattern.compile("(?:v=|/v/|/embed/|/shorts/|youtu\\.be/)([0-9A-Za-z_-]{11})");
-    private static final Pattern RE_VIDEO_ID_BARE = Pattern.compile("^([0-9A-Za-z_-]{11})$");
-    private static final Pattern RE_CODECS = Pattern.compile("codecs=\"([^\"]+)\"");
-    private static final Pattern RE_API_KEY = Pattern.compile("\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
-    private static final Pattern RE_STS = Pattern.compile("(?:signatureTimestamp|sts)\\s*:\\s*(\\d{5})");
-    private static final Pattern RE_YTCFG = Pattern.compile("ytcfg\\.set\\s*\\(\\s*(\\{.+?})\\s*\\)\\s*;", Pattern.DOTALL);
+            safePattern("(?:v=|/v/|/embed/|/shorts/|youtu\\.be/)([0-9A-Za-z_-]{11})");
+    private static final Pattern RE_VIDEO_ID_BARE = safePattern("^([0-9A-Za-z_-]{11})$");
+    private static final Pattern RE_CODECS = safePattern("codecs=\"([^\"]+)\"");
+    private static final Pattern RE_API_KEY = safePattern("\"INNERTUBE_API_KEY\":\"([^\"]+)\"");
+    private static final Pattern RE_STS = safePattern("(?:signatureTimestamp|sts)\\s*:\\s*(\\d{5})");
+    // Android's ICU regex engine rejects an unescaped closing brace, unlike the desktop JDK
+    // engine. Every literal brace in this file is escaped for that reason.
+    private static final Pattern RE_YTCFG = safePattern("ytcfg\\.set\\s*\\(\\s*(\\{.+?\\})\\s*\\)\\s*;", Pattern.DOTALL);
 
     /** Result of one successful extraction. */
     static class Extracted {
@@ -572,7 +600,7 @@ class YouTubeLite {
             if (TextUtils.isEmpty(nValue)) return mediaUrl;
             String path = uri.getPath();
             if (path == null) return mediaUrl;
-            Matcher m = Pattern.compile("/n/([^/]+)").matcher(path);
+            Matcher m = safePattern("/n/([^/]+)").matcher(path);
             if (m.find() && !m.group(1).equals(nValue)) {
                 return mediaUrl.replaceFirst("/n/" + Pattern.quote(m.group(1)), "/n/" + nValue);
             }
@@ -601,7 +629,7 @@ class YouTubeLite {
                 "\"signature\",\\s*([a-zA-Z0-9_$]+)\\(",
                 "([a-zA-Z0-9_$]+)=function\\(a\\)\\{a=a\\.split\\(\"\"\\);",
         }) {
-            Matcher m = Pattern.compile(pattern).matcher(code);
+            Matcher m = safePattern(pattern).matcher(code);
             if (m.find()) {
                 name = m.group(1);
                 break;
@@ -610,7 +638,7 @@ class YouTubeLite {
         if (name == null) return null;
         String body = extractJsFunctionBody(code, name);
         if (TextUtils.isEmpty(body)) return null;
-        String helper = search(Pattern.compile("([a-zA-Z0-9_$]+)\\.[a-zA-Z0-9_$]+\\(a,\\d+\\)"), body);
+        String helper = search(safePattern("([a-zA-Z0-9_$]+)\\.[a-zA-Z0-9_$]+\\(a,\\d+\\)"), body);
         Map<String, String> helperMap = helper == null ? new HashMap<>() : extractHelperObject(code, helper);
         List<String[]> plan = new ArrayList<>();
         for (String part : body.split(";")) {
@@ -618,17 +646,17 @@ class YouTubeLite {
                 plan.add(new String[]{"reverse", "0"});
                 continue;
             }
-            Matcher m = Pattern.compile("\\.slice\\((\\d+)\\)").matcher(part);
+            Matcher m = safePattern("\\.slice\\((\\d+)\\)").matcher(part);
             if (m.find()) {
                 plan.add(new String[]{"slice", m.group(1)});
                 continue;
             }
-            m = Pattern.compile("\\.splice\\(0,(\\d+)\\)").matcher(part);
+            m = safePattern("\\.splice\\(0,(\\d+)\\)").matcher(part);
             if (m.find()) {
                 plan.add(new String[]{"splice", m.group(1)});
                 continue;
             }
-            m = Pattern.compile("([a-zA-Z0-9_$]+)\\.([a-zA-Z0-9_$]+)\\(a,(\\d+)\\)").matcher(part);
+            m = safePattern("([a-zA-Z0-9_$]+)\\.([a-zA-Z0-9_$]+)\\(a,(\\d+)\\)").matcher(part);
             if (m.find() && m.group(1).equals(helper)) {
                 String op = helperMap.get(m.group(2));
                 if (op != null) plan.add(new String[]{op, m.group(3)});
@@ -640,12 +668,12 @@ class YouTubeLite {
     private Map<String, String> extractHelperObject(String code, String name) {
         Map<String, String> result = new HashMap<>();
         if (TextUtils.isEmpty(name)) return result;
-        Matcher m = Pattern.compile("var\\s+" + Pattern.quote(name) + "=\\{(.+?)};", Pattern.DOTALL).matcher(code);
+        Matcher m = safePattern("var\\s+" + Pattern.quote(name) + "=\\{(.+?)\\};", Pattern.DOTALL).matcher(code);
         if (!m.find()) {
-            m = Pattern.compile(Pattern.quote(name) + "=\\{(.+?)};", Pattern.DOTALL).matcher(code);
+            m = safePattern(Pattern.quote(name) + "=\\{(.+?)\\};", Pattern.DOTALL).matcher(code);
             if (!m.find()) return result;
         }
-        Matcher fn = Pattern.compile("([a-zA-Z0-9_$]+):function\\([a-z,]+\\)\\{(.*?)}", Pattern.DOTALL)
+        Matcher fn = safePattern("([a-zA-Z0-9_$]+):function\\([a-z,]+\\)\\{(.*?)\\}", Pattern.DOTALL)
                 .matcher(m.group(1));
         while (fn.find()) {
             String method = fn.group(1);
@@ -666,7 +694,7 @@ class YouTubeLite {
                 Pattern.quote(name) + "\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{",
                 "var\\s+" + Pattern.quote(name) + "\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{",
         }) {
-            Matcher m = Pattern.compile(pattern).matcher(code);
+            Matcher m = safePattern(pattern).matcher(code);
             if (m.find()) {
                 start = m.end() - 1;
                 break;
@@ -929,7 +957,7 @@ class YouTubeLite {
                 "\"PLAYER_JS_URL\":\"([^\"]+)\"",
                 "(/s/player/[^\"\\\\]+/base\\.js)",
         }) {
-            String value = search(Pattern.compile(pattern), text);
+            String value = search(safePattern(pattern), text);
             if (value != null) return value.replace("\\/", "/");
         }
         return "";
