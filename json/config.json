@@ -75,6 +75,17 @@
       "quickSearch": 0,
       "filterable": 0,
       "changeable": 0
+    },
+    {
+      "key": "muou",
+      "name": "木偶",
+      "type": 3,
+      "api": "csp_Muou",
+      "searchable": 1,
+      "quickSearch": 1,
+      "filterable": 0,
+      "changeable": 0,
+      "ext": "./muou.json"
     }
   ],
   "doh": [

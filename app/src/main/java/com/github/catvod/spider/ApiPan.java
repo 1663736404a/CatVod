@@ -1,7 +1,5 @@
 package com.github.catvod.spider;
 
-import com.github.catvod.bean.Vod;
-
 import java.util.List;
 
 /**
@@ -28,9 +26,23 @@ interface ApiPan {
     /**
      * 列出分享链里的视频文件。
      *
-     * @return 每个 {@link Vod} 的 vodId 是该驱动自定义的定位串，会原样回到 {@link #play}
+     * @return 供详情页展开成选集的条目，顺序即选集顺序
      */
-    List<Vod> parse(String shareUrl) throws Exception;
+    List<Item> parse(String shareUrl) throws Exception;
+
+    /** 分享链里的一个可播文件。 */
+    class Item {
+
+        /** 选集显示名。 */
+        final String name;
+        /** 驱动自定义的定位串，会原样回到 {@link #play}。 */
+        final String id;
+
+        Item(String name, String id) {
+            this.name = name;
+            this.id = id;
+        }
+    }
 
     /**
      * 换取播放地址。

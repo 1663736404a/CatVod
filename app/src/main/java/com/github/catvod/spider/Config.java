@@ -34,8 +34,11 @@ import java.util.List;
 public class Config extends Spider {
 
     /** 已注册的网盘驱动。新增网盘时在这里加一行即可。 */
-    private static final List<ApiPan> PANS = Arrays.asList(
-            ApiQuark.get()
+    static final List<ApiPan> PANS = Arrays.asList(
+            ApiQuark.get(),
+            new ApiStub("uc", "UC网盘", "drive.uc.cn"),
+            new ApiStub("baidu", "百度网盘", "pan.baidu.com"),
+            new ApiStub("115", "115网盘", "115.com")
     );
 
     /** action 串前缀，避免和其他 spider 的 action 混淆。 */

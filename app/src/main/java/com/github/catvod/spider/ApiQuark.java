@@ -5,7 +5,6 @@ import android.text.TextUtils;
 
 import com.github.catvod.bean.Result;
 import com.github.catvod.bean.Sub;
-import com.github.catvod.bean.Vod;
 import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Json;
 import com.google.gson.JsonArray;
@@ -332,7 +331,7 @@ final class ApiQuark implements ApiPan {
     }
 
     @Override
-    public List<Vod> parse(String shareUrl) throws Exception {
+    public List<ApiPan.Item> parse(String shareUrl) throws Exception {
         String[] share = shareData(shareUrl);
         if (share == null) return new ArrayList<>();
         if (!logged()) throw new Exception("请先在设置中心登录夸克网盘");
@@ -342,7 +341,7 @@ final class ApiQuark implements ApiPan {
         listFiles(share[0], stoken, share[1], 1, videos, subs, 0);
         matchSubtitles(videos, subs);
 
-        List<Vod> list = new ArrayList<>();
+        List<ApiPan.Item> list = new ArrayList<>();
         for (JsonObject item : videos) {
             JsonObject sub = item.has("_sub") ? item.getAsJsonObject("_sub") : null;
             // 定位串：shareId*stoken*fid*fidToken*subFid*subFidToken
@@ -354,10 +353,7 @@ final class ApiQuark implements ApiPan {
                     sub == null ? "" : str(sub, "fid", ""),
                     sub == null ? "" : str(sub, "share_fid_token", ""),
             });
-            Vod vod = new Vod();
-            vod.setVodId(id);
-            vod.setVodName(str(item, "file_name", ""));
-            list.add(vod);
+            list.add(new ApiPan.Item(str(item, "file_name", ""), id));
         }
         return list;
     }
