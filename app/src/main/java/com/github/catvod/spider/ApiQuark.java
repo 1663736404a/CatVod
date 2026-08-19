@@ -6,7 +6,9 @@ import android.text.TextUtils;
 import com.github.catvod.bean.Result;
 import com.github.catvod.bean.Sub;
 import com.github.catvod.crawler.SpiderDebug;
+import com.github.catvod.net.OkHttp;
 import com.github.catvod.utils.Json;
+import com.github.catvod.utils.Notify;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -169,11 +171,76 @@ final class ApiQuark implements ApiPan {
     }
 
     /* ------------------------------------------------------------------ */
-    /* 扫码登录                                                            */
+    /* 登录流程                                                            */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Cookie 输入框，中间键切到扫码。
+     *
+     * <p>输入内容支持两种：直接粘贴 Cookie，或粘贴一个返回 Cookie 文本的 URL（有人把凭据放在自
+     * 建接口上）。
+     */
     @Override
-    public String qrcode() throws Exception {
+    public void startFlow() {
+        ApiUi.input("请输入夸克 Cookie", "从浏览器复制 pan.quark.cn 的完整 Cookie",
+                "扫码登录", this::onCookieInput, this::startScan);
+    }
+
+    private void onCookieInput(String text) {
+        Init.execute(() -> {
+            try {
+                String value = text.startsWith("http") ? OkHttp.string(text) : text;
+                if (TextUtils.isEmpty(value)) {
+                    Notify.show("内容为空，未保存");
+                    return;
+                }
+                setCookie(value);
+                Notify.show(logged() ? "夸克已保存：" + status() : "夸克保存失败");
+            } catch (Throwable e) {
+                SpiderDebug.log("夸克 Cookie 写入失败 " + e);
+                Notify.show("保存失败：" + e);
+            }
+        });
+    }
+
+    /**
+     * 扫码登录。
+     *
+     * <p>整个流程都在后台线程：取 token 出码 → 每 2 秒轮询一次 → 拿到 service_ticket 换 Cookie。
+     * 上限 120 秒，用户关掉弹窗也会立即停止轮询，不留后台空转。
+     */
+    @Override
+    public void startScan() {
+        Init.execute(() -> {
+            ApiUi.Panel panel = null;
+            try {
+                String target = qrcode();
+                panel = ApiUi.qrcode(target, "请使用夸克 App 扫码登录");
+                for (int i = 0; i < 60; i++) {
+                    Thread.sleep(2000);
+                    if (panel.closed()) return;
+                    if (poll()) {
+                        panel.close();
+                        Notify.show("夸克登录成功：" + status());
+                        return;
+                    }
+                }
+                panel.close();
+                Notify.show("夸克扫码超时，请重试");
+            } catch (Throwable e) {
+                if (panel != null) panel.close();
+                SpiderDebug.log("夸克扫码登录失败 " + e);
+                Notify.show("扫码失败：" + (TextUtils.isEmpty(e.getMessage()) ? e.toString() : e.getMessage()));
+            }
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 扫码接口                                                            */
+    /* ------------------------------------------------------------------ */
+
+    /** 取二维码 token，返回待编码的扫码地址。 */
+    private String qrcode() throws Exception {
         Map<String, String> header = new HashMap<>();
         header.put("User-Agent", UA_WEB);
         ApiHttp.Res result = ApiHttp.get(
@@ -183,15 +250,17 @@ final class ApiQuark implements ApiPan {
         if (TextUtils.isEmpty(token)) throw new Exception("夸克二维码获取失败");
         loginToken = token;
         loginCookie = ApiHttp.cookies(result.headers);
-        String target = "https://su.quark.cn/4_eMHBJ?token=" + token
+        return "https://su.quark.cn/4_eMHBJ?token=" + token
                 + "&client_id=532&ssb=weblogin&uc_param_str="
                 + "&uc_biz_str=S%3Acustom%7COPT%3ASAREA%400%7COPT%3AIMMERSIVE%401%7COPT%3ABACK_BTN_STYLE%400";
-        // jar 依赖白名单里没有二维码库，本地不生成位图，交给在线接口渲染成图片
-        return "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=" + Uri.encode(target);
     }
 
-    @Override
-    public boolean checkQrcode() throws Exception {
+    /**
+     * 轮询一次扫码结果。
+     *
+     * @return 登录成功返回 true；仍在等待扫码返回 false；失败抛异常
+     */
+    private boolean poll() throws Exception {
         if (TextUtils.isEmpty(loginToken)) throw new Exception("请先获取二维码");
         Map<String, String> header = new HashMap<>();
         header.put("User-Agent", UA_WEB);

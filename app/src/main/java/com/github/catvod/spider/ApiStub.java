@@ -1,5 +1,6 @@
 package com.github.catvod.spider;
 
+import com.github.catvod.utils.Notify;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -74,12 +75,12 @@ final class ApiStub implements ApiPan {
     }
 
     @Override
-    public String qrcode() throws Exception {
-        throw new Exception(name + "暂未支持");
+    public void startFlow() {
+        Notify.show(name + "暂未支持，敬请期待");
     }
 
     @Override
-    public boolean checkQrcode() throws Exception {
-        throw new Exception(name + "暂未支持");
+    public void startScan() {
+        Notify.show(name + "暂未支持，敬请期待");
     }
 }

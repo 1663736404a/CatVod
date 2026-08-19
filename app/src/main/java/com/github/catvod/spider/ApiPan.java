@@ -71,16 +71,17 @@ interface ApiPan {
     void logout();
 
     /**
-     * 开始一次扫码登录，返回二维码图片地址。
+     * 开始一次登录流程。
      *
-     * @return 可直接给 ImageView 加载的 URL 或 data URI
+     * <p>由驱动自己负责整个交互：弹 Cookie 输入框、出二维码、轮询扫码结果、写入凭据并提示结果。
+     * 方法本身立即返回，不阻塞调用线程 —— 设置中心点一下就不用再管了。
      */
-    String qrcode() throws Exception;
+    void startFlow();
 
     /**
-     * 轮询扫码结果。
+     * 直接开始扫码登录，跳过 Cookie 输入框。
      *
-     * @return 登录成功返回 true；仍在等待扫码返回 false；失败抛异常
+     * <p>和 {@link #startFlow()} 一样是异步的。不支持扫码的驱动可以只提示一句。
      */
-    boolean checkQrcode() throws Exception;
+    void startScan();
 }

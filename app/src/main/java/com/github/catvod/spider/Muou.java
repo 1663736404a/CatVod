@@ -31,9 +31,9 @@ import java.util.Map;
  * <p>站点本身只提供影片信息和网盘分享链，播放交给 {@link ApiPan} 驱动：详情页把页面里的分享链
  * 交给能识别它的驱动展开成选集，{@link #playerContent} 再回调同一个驱动换直链。
  *
- * <p>域名必须由 ext 提供，原实现同样是从配置读取而非硬编码 —— 这类站点换域名很频繁。ext 支持两
- * 种写法：直接给一个 URL 字符串，或给 {@code {"sites": ["https://a", "https://b"]}} 让它按顺序
- * 探测可用的那个。
+ * <p>域名必须由 ext 提供，原实现同样是从配置读取而非硬编码 —— 这类站点换域名很频繁。ext 直接写在
+ * {@code config.json} 的站点节点里，宿主会把对象序列化成字符串传进来。支持两种写法：直接给一个
+ * URL 字符串，或给 {@code {"sites": ["https://a", "https://b"]}} 让它按顺序探测可用的那个。
  */
 public class Muou extends Spider {
 
@@ -70,41 +70,47 @@ public class Muou extends Spider {
     }
 
     /* ------------------------------------------------------------------ */
-    /* 域名探测                                                            */
+    /* 域名选择                                                            */
     /* ------------------------------------------------------------------ */
 
     /**
      * 取一个可用域名。
      *
-     * <p>逐个试，拿到含站点模板特征的页面就认定可用并缓存。串行而非并发：宿主已在后台线程，候选
-     * 数量很少，并发的复杂度换不来明显收益。
+     * <p>逐个试，第一个能返回非空 HTML 的就用并缓存。只看「有没有响应」，不校验页面结构 —— 站点
+     * 模板会改，用特征串判活会在改版当天把所有域名判死。
+     *
+     * <p>全都拿不到就回落到第一个域名，让后续请求把真实错误抛出来，而不是在这里报一个笼统的
+     * 「域名均不可用」。串行而非并发：宿主已在后台线程，候选就四个，并发的复杂度换不来收益。
      */
     private String host() throws Exception {
         if (!TextUtils.isEmpty(host)) return host;
         synchronized (this) {
             if (!TextUtils.isEmpty(host)) return host;
-            if (hosts.isEmpty()) {
-                throw new Exception("请在站点 ext 里填写木偶域名，例如 {\"sites\":[\"https://xxx.com\"]}");
-            }
-            List<String> tried = new ArrayList<>();
+            List<String> candidates = new ArrayList<>();
             for (String candidate : hosts) {
                 String url = candidate.trim();
                 while (url.endsWith("/")) url = url.substring(0, url.length() - 1);
-                if (url.isEmpty()) continue;
-                tried.add(url);
+                if (!url.isEmpty()) candidates.add(url);
+            }
+            if (candidates.isEmpty()) {
+                throw new Exception("请在 config.json 的站点 ext 里填写木偶域名，"
+                        + "例如 {\"sites\":[\"https://xxx.com\"]}");
+            }
+            for (String url : candidates) {
                 try {
                     String html = OkHttp.string(url, null, header(), 8000);
-                    // module-item 是该模板的列表容器，用它确认拿到的是站点本体而不是跳转页
-                    if (!TextUtils.isEmpty(html) && html.contains("module-item")) {
+                    if (!TextUtils.isEmpty(html)) {
                         host = url;
                         return host;
                     }
-                    SpiderDebug.log("木偶域名响应不含站点特征 " + url);
+                    SpiderDebug.log("木偶域名响应为空 " + url);
                 } catch (Throwable e) {
                     SpiderDebug.log("木偶域名不可用 " + url + " " + e);
                 }
             }
-            throw new Exception("木偶域名均不可用: " + TextUtils.join(", ", tried));
+            host = candidates.get(0);
+            SpiderDebug.log("木偶所有域名探测失败，回落到 " + host);
+            return host;
         }
     }
 

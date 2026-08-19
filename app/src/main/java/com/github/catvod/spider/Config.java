@@ -1,9 +1,6 @@
 package com.github.catvod.spider;
 
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.Context;
-import android.net.Uri;
 import android.text.TextUtils;
 
 import com.github.catvod.bean.Class;
@@ -11,7 +8,8 @@ import com.github.catvod.bean.Result;
 import com.github.catvod.bean.Vod;
 import com.github.catvod.crawler.Spider;
 import com.github.catvod.crawler.SpiderDebug;
-import com.github.catvod.utils.Util;
+import com.github.catvod.utils.Image;
+import com.github.catvod.utils.Notify;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -22,11 +20,11 @@ import java.util.List;
 /**
  * 网盘设置中心。
  *
- * <p>本身不提供影片，只作为各网盘驱动的配置界面：首页列出所有已注册驱动，进入某个驱动后是它的
- * 操作项（扫码登录、填 Cookie、查看状态、清除登录）。
+ * <p>本身不提供影片，只作为各网盘驱动的配置界面：首页每个分类是一家网盘，进去是它的操作项。
  *
- * <p>交互靠 {@link Vod#action(String)} 和 {@link #action(String)}：列表项带上 action 串，用户
- * 点击后宿主把该串回传过来，这里执行对应操作并用 {@link Result#notify(String)} 反馈。
+ * <p>交互方式和 lushunming 版的 {@code Introduce} 一致 —— 列表项的 vodId 就是操作码，宿主点击
+ * 后走 {@link #detailContent}，在那里执行对应操作。之所以不用 {@link Vod#setAction}，是因为
+ * action 只能回文本，弹不出二维码和输入框；detailContent 里可以直接调驱动的 UI 流程。
  *
  * <p>凭据由 {@link ApiStore} 明文存在 SharedPreferences，取得 root 或 adb 的一方可以直接读到，
  * 不要在共用设备上登录。
@@ -41,8 +39,8 @@ public class Config extends Spider {
             new ApiStub("115", "115网盘", "115.com")
     );
 
-    /** action 串前缀，避免和其他 spider 的 action 混淆。 */
-    private static final String ACT = "pan://";
+    /** 操作码分隔符：{@code <驱动key>/<操作>}。 */
+    private static final String SEP = "/";
 
     @Override
     public void init(Context context, String extend) {
@@ -58,7 +56,7 @@ public class Config extends Spider {
     /* 列表                                                                */
     /* ------------------------------------------------------------------ */
 
-    /** 首页即设置中心，每个分类是一个网盘。 */
+    /** 首页即设置中心，每个分类是一家网盘。 */
     @Override
     public String homeContent(boolean filter) {
         List<Class> classes = new ArrayList<>();
@@ -66,50 +64,33 @@ public class Config extends Spider {
         return Result.string(classes, new LinkedHashMap<>());
     }
 
-    /** 某个网盘的操作项。 */
+    /**
+     * 某家网盘的操作项。
+     *
+     * <p>「当前状态」放第一位，会实时打一次接口取昵称和会员等级，所以进这一页会有一次网络请求。
+     */
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
         ApiPan pan = find(tid);
         if (pan == null) return Result.get().vod(new ArrayList<>()).page().string();
-        List<Vod> list = new ArrayList<>();
         boolean logged = pan.logged();
-
-        list.add(item("当前状态", logged ? pan.status() : "未登录",
-                ACT + pan.key() + "/status"));
-        list.add(item("扫码登录", logged ? "已登录，可重新扫码更换账号" : "使用" + pan.name() + "App 扫码",
-                ACT + pan.key() + "/qrcode"));
-        list.add(item("手动填入 Cookie", logged ? "已填写" : "从浏览器复制完整 Cookie",
-                ACT + pan.key() + "/cookie"));
-        list.add(item("清除本地登录", "保留手填凭据，只清运行期刷新的部分",
-                ACT + pan.key() + "/clearLocal"));
-        list.add(item("清除账号", "彻底删除本地保存的凭据",
-                ACT + pan.key() + "/logout"));
+        List<Vod> list = new ArrayList<>();
+        list.add(item(pan, "status", "当前状态", logged ? pan.status() : "未登录"));
+        list.add(item(pan, "login", "点击登录",
+                logged ? "已登录，可重新填 Cookie 或扫码换号" : "填 Cookie 或扫码"));
+        list.add(item(pan, "scan", "点击扫码", "直接出二维码，用 " + pan.name() + " App 扫"));
+        list.add(item(pan, "clearLocal", "清除本地登录", "只清运行期刷新的部分，保留手填凭据"));
+        list.add(item(pan, "logout", "点击删除", "彻底删除本地保存的凭据"));
         return Result.get().vod(list).page().string();
     }
 
-    private static Vod item(String name, String remark, String action) {
+    private static Vod item(ApiPan pan, String op, String name, String remark) {
         Vod vod = new Vod();
-        vod.setVodId(action);
+        vod.setVodId(pan.key() + SEP + op);
         vod.setVodName(name);
         vod.setVodRemarks(remark);
-        vod.setAction(action);
+        vod.setVodPic(Image.FOLDER);
         return vod;
-    }
-
-    /**
-     * 详情页兜底。
-     *
-     * <p>宿主对带 action 的条目通常直接回调 {@link #action(String)} 而不进详情页，但不同版本行为
-     * 不一致，这里保证进来了也不会白屏。
-     */
-    @Override
-    public String detailContent(List<String> ids) {
-        String id = ids.get(0);
-        Vod vod = new Vod();
-        vod.setVodId(id);
-        vod.setVodName("设置中心");
-        vod.setVodContent("请返回列表点击对应项目进行操作");
-        return Result.string(vod);
     }
 
     /* ------------------------------------------------------------------ */
@@ -119,107 +100,61 @@ public class Config extends Spider {
     /**
      * 执行设置项。
      *
-     * <p>action 格式 {@code pan://<驱动key>/<操作>}，可带 {@code ?value=} 用于回填输入。
+     * <p>宿主点条目就会走到这里，vodId 就是操作码。登录类操作都是异步的：方法立刻返回一个占位
+     * 详情页，弹窗和轮询在后台继续，结果用 Toast 提示。
      */
     @Override
-    public String action(String action) {
+    public String detailContent(List<String> ids) {
+        String id = ids.get(0);
         try {
-            if (TextUtils.isEmpty(action) || !action.startsWith(ACT)) return Result.notify("未知操作");
-            String path = action.substring(ACT.length());
-            String query = "";
-            int mark = path.indexOf('?');
-            if (mark > 0) {
-                query = path.substring(mark + 1);
-                path = path.substring(0, mark);
-            }
-            int slash = path.indexOf('/');
-            if (slash <= 0) return Result.notify("未知操作");
-            ApiPan pan = find(path.substring(0, slash));
-            if (pan == null) return Result.notify("未知网盘");
-            String op = path.substring(slash + 1);
-
+            int slash = id.indexOf(SEP);
+            if (slash <= 0) return placeholder(id, "设置中心", "请返回列表点击具体项目");
+            ApiPan pan = find(id.substring(0, slash));
+            if (pan == null) return placeholder(id, "设置中心", "未知网盘");
+            String op = id.substring(slash + SEP.length());
             switch (op) {
                 case "status":
-                    return Result.notify(pan.name() + "：" + (pan.logged() ? pan.status() : "未登录"));
-                case "qrcode":
-                    return qrcode(pan);
-                case "check":
-                    return check(pan);
-                case "cookie":
-                    return cookie(pan, query);
+                    String status = pan.logged() ? pan.status() : "未登录";
+                    Notify.show(pan.name() + "：" + status);
+                    return placeholder(id, pan.name(), status);
+                case "login":
+                    pan.startFlow();
+                    return placeholder(id, pan.name(), "请在弹出的窗口里填 Cookie 或点「扫码登录」");
+                case "scan":
+                    pan.startScan();
+                    return placeholder(id, pan.name(), "正在获取二维码");
                 case "clearLocal":
                     if (pan instanceof ApiQuark) ((ApiQuark) pan).clearLocal();
                     else pan.logout();
-                    return Result.notify("已清除本地登录");
+                    Notify.show("已清除本地登录");
+                    return placeholder(id, pan.name(), "已清除本地登录");
                 case "logout":
                     pan.logout();
-                    return Result.notify("已清除" + pan.name() + "账号");
+                    Notify.show("已删除" + pan.name() + "账号");
+                    return placeholder(id, pan.name(), "已删除账号");
                 default:
-                    return Result.notify("未知操作");
+                    return placeholder(id, pan.name(), "未知操作");
             }
         } catch (Throwable e) {
             SpiderDebug.log("设置中心操作失败 " + e);
-            return Result.notify(TextUtils.isEmpty(e.getMessage()) ? "操作失败" : e.getMessage());
+            String message = TextUtils.isEmpty(e.getMessage()) ? e.toString() : e.getMessage();
+            Notify.show(message);
+            return placeholder(id, "设置中心", message);
         }
     }
 
     /**
-     * 出二维码。
+     * 占位详情页。
      *
-     * <p>宿主的 action 回调只能回文本，没有直接弹图的通道，所以把二维码图片地址复制到剪贴板并提示
-     * 用户。扫完之后点「当前状态」或再点一次本项会触发轮询。
+     * <p>不给 vod_play_from/vod_play_url，宿主就不会显示播放按钮，避免用户在设置项上点播放。
      */
-    private String qrcode(ApiPan pan) throws Exception {
-        String url = pan.qrcode();
-        Util.copy(url);
-        return Result.notify("二维码地址已复制，用浏览器打开后用 " + pan.name()
-                + " App 扫码，完成后点「当前状态」确认");
-    }
-
-    /** 轮询扫码结果。 */
-    private String check(ApiPan pan) throws Exception {
-        return pan.checkQrcode()
-                ? Result.notify("登录成功：" + pan.status())
-                : Result.notify("尚未扫码或未确认，请稍后再试");
-    }
-
-    /**
-     * 写入 Cookie。
-     *
-     * <p>宿主不提供输入框，所以从剪贴板读 —— 用户先复制好 Cookie，再点这一项。
-     */
-    private String cookie(ApiPan pan, String query) {
-        String value = value(query, "value");
-        if (TextUtils.isEmpty(value)) value = paste();
-        if (TextUtils.isEmpty(value)) return Result.notify("剪贴板为空，请先复制 Cookie 再点此项");
-        pan.setCookie(value);
-        return Result.notify(pan.logged() ? "已保存：" + pan.status() : "保存失败");
-    }
-
-    /** 读剪贴板首条文本。{@code Util} 只有 copy 没有 paste，这里自己取。 */
-    private static String paste() {
-        try {
-            ClipboardManager manager = (ClipboardManager)
-                    Init.context().getSystemService(Context.CLIPBOARD_SERVICE);
-            if (manager == null || !manager.hasPrimaryClip()) return "";
-            ClipData data = manager.getPrimaryClip();
-            if (data == null || data.getItemCount() == 0) return "";
-            CharSequence text = data.getItemAt(0).coerceToText(Init.context());
-            return text == null ? "" : text.toString().trim();
-        } catch (Throwable e) {
-            SpiderDebug.log("读取剪贴板失败 " + e);
-            return "";
-        }
-    }
-
-    private static String value(String query, String key) {
-        if (TextUtils.isEmpty(query)) return "";
-        for (String part : query.split("&")) {
-            int eq = part.indexOf('=');
-            if (eq <= 0) continue;
-            if (key.equals(part.substring(0, eq))) return Uri.decode(part.substring(eq + 1));
-        }
-        return "";
+    private static String placeholder(String id, String name, String content) {
+        Vod vod = new Vod();
+        vod.setVodId(id);
+        vod.setVodName(name);
+        vod.setVodPic(Image.FOLDER);
+        vod.setVodContent(content);
+        return Result.string(vod);
     }
 
     /* ------------------------------------------------------------------ */

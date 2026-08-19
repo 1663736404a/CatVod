@@ -13,6 +13,7 @@ quickjsWrapper = "3.2.3"
 robolectric = "4.16.1"
 sardineAndroid = "0.9"
 smbj = "0.14.0"
+zxing = "3.5.3"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
@@ -28,3 +29,4 @@ quickjs-wrapper = { module = "wang.harlon.quickjs:wrapper-android", version.ref 
 robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
 sardine-android = { module = "com.github.thegrizzlylabs:sardine-android", version.ref = "sardineAndroid" }
 smbj = { module = "com.hierynomus:smbj", version.ref = "smbj" }
+zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
