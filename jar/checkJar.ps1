@@ -1,12 +1,36 @@
 param(
     [string] $Jar = (Join-Path $PSScriptRoot "custom_spider.jar")
 )
-
 $ErrorActionPreference = "Stop"
+
+# When this script is launched from Gradle Exec, PowerShell 5.1 can start without
+# Microsoft.PowerShell.Utility auto-loaded, which makes Get-FileHash, Write-Host, Sort-Object and
+# Select-Object all unavailable. Importing it explicitly restores them.
+try {
+    if (-not (Get-Command Write-Host -ErrorAction SilentlyContinue)) {
+        Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+    }
+} catch {
+    [Console]::Error.WriteLine("FAIL cannot load Microsoft.PowerShell.Utility: $_")
+    exit 1
+}
+
 
 function Fail([string] $Message) {
     Write-Host "FAIL $Message"
     exit 1
+}
+# Get-FileHash lives in Microsoft.PowerShell.Utility, which is not always loaded when the script
+# is launched from Gradle Exec. Fall back to .NET so the check works on any PowerShell edition.
+function FileMd5([string] $Path) {
+    $hasher = [Security.Cryptography.MD5]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        return [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $hasher.Dispose()
+    }
 }
 
 function StartsWithAny([string] $Value, [string[]] $Prefixes) {
@@ -27,7 +51,7 @@ $size = (Get-Item -LiteralPath $Jar).Length
 
 $md5Path = "$Jar.md5"
 if (-not (Test-Path -LiteralPath $md5Path)) { Fail "missing md5: $md5Path" }
-$actualMd5 = (Get-FileHash -Algorithm MD5 -LiteralPath $Jar).Hash.ToLowerInvariant()
+$actualMd5 = FileMd5 $Jar
 $expectedMd5 = (Get-Content -Raw -LiteralPath $md5Path).Trim().ToLowerInvariant()
 if ($actualMd5 -ne $expectedMd5) { Fail "md5 mismatch: $actualMd5 != $expectedMd5" }
 

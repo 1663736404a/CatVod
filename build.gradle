@@ -72,8 +72,22 @@ def verifySpiderJar = tasks.register('verifySpiderJar', Exec) {
     outputs.upToDateWhen { false }
     doFirst {
         ant.checksum(file: spiderJarFile.asFile, algorithm: 'MD5', fileext: '.md5', forceOverwrite: true)
+        // Windows PowerShell 5.1 launched from Gradle Exec does not always have the Utility
+        // module loaded, which makes Get-FileHash unavailable. PowerShell 7 (pwsh) ships with the
+        // runners and modern Windows; fall back to powershell only when pwsh is missing.
+        def shell = ['pwsh', 'powershell'].find { name ->
+            try {
+                def probe = new ProcessBuilder(name, '-NoProfile', '-Command', 'exit 0')
+                probe.redirectErrorStream(true)
+                def process = probe.start()
+                process.inputStream.close()
+                process.waitFor() == 0
+            } catch (Throwable ignored) {
+                false
+            }
+        } ?: 'powershell'
+        commandLine shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', spiderCheckScript.asFile.absolutePath, '-Jar', spiderJarFile.asFile.absolutePath
     }
-    commandLine 'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', spiderCheckScript.asFile.absolutePath, '-Jar', spiderJarFile.asFile.absolutePath
 }
 
 tasks.register('spiderJar') {
