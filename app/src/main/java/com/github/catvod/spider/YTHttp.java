@@ -35,17 +35,37 @@ final class YTHttp {
     private final Map<String, String> baseHeaders = new HashMap<>();
 
     YTHttp(Map<String, String> headers) {
-        if (headers != null) baseHeaders.putAll(headers);
-        this.client = build();
+        this(headers, null);
     }
 
-    private static OkHttpClient build() {
+    /**
+     * @param proxy optional {@code host:port} HTTP proxy, taken from the site's {@code proxy}
+     *              extend value. All YouTube traffic from this spider goes through it.
+     */
+    YTHttp(Map<String, String> headers, String proxy) {
+        if (headers != null) baseHeaders.putAll(headers);
+        this.client = build(proxy);
+    }
+    private static OkHttpClient build(String proxy) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
-                .connectTimeout(15, TimeUnit.SECONDS)
+.connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .retryOnConnectionFailure(true);
+        if (proxy != null && !proxy.isEmpty()) {
+            int colon = proxy.lastIndexOf(':');
+            if (colon > 0) {
+                try {
+                    String host = proxy.substring(0, colon);
+                    int port = Integer.parseInt(proxy.substring(colon + 1).trim());
+                    builder.proxy(new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                            new java.net.InetSocketAddress(host, port)));
+                } catch (Throwable ignored) {
+                    // A malformed proxy value is ignored rather than breaking every request.
+                }
+            }
+        }
         try {
             builder.hostnameVerifier((hostname, session) -> true)
                     .sslSocketFactory(sslContext().getSocketFactory(), trustAll());

@@ -70,7 +70,7 @@ public class YouTube extends Spider {
         header.put("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
         header.put("Referer", "https://www.youtube.com/");
         this.proxyStr = readProxy();
-        this.http = new YTHttp(header);
+        this.http = new YTHttp(header, proxyStr);
         this.yt = new YouTubeLite(http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
     }
