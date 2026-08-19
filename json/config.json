@@ -65,6 +65,16 @@
       "searchable": 1,
       "changeable": 0,
       "ext": "./youtube.json"
+    },
+    {
+      "key": "设置中心",
+      "name": "设置中心",
+      "type": 3,
+      "api": "csp_Config",
+      "searchable": 0,
+      "quickSearch": 0,
+      "filterable": 0,
+      "changeable": 0
     }
   ],
   "doh": [
