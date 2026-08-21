@@ -15,6 +15,24 @@ final class YoutubeNsig {
 
     private YoutubeNsig() {}
 
+    static boolean needsSolve(String url) {
+        return !TextUtils.isEmpty(url) && !TextUtils.isEmpty(android.net.Uri.parse(url).getQueryParameter("n"));
+    }
+
+    static String replace(String url, String solved) {
+        if (!needsSolve(url) || TextUtils.isEmpty(solved)) return url;
+        android.net.Uri uri = android.net.Uri.parse(url);
+        StringBuilder query = new StringBuilder();
+        for (String name : uri.getQueryParameterNames()) {
+            for (String value : uri.getQueryParameters(name)) {
+                if (query.length() > 0) query.append('&');
+                query.append(android.net.Uri.encode(name)).append('=')
+                        .append(android.net.Uri.encode("n".equals(name) ? solved : value));
+            }
+        }
+        return uri.buildUpon().clearQuery().encodedQuery(query.toString()).build().toString();
+    }
+
     static String solve(String playerCode, String value) {
         if (TextUtils.isEmpty(playerCode) || TextUtils.isEmpty(value)) return null;
         String factory = factory(playerCode);
