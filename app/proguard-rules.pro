@@ -32,7 +32,8 @@
 
 # Spider
 -keep class com.github.catvod.crawler.* { *; }
--keep class com.github.catvod.spider.* { public <methods>; }
+-keep class com.github.catvod.spider.** { *; }
+-dontwarn android.webkit.**
 -keep class com.github.catvod.js.Function { *; }
 
 # OkHttp
