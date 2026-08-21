@@ -1,5 +1,7 @@
 package com.github.catvod.spider;
 
+import com.github.catvod.crawler.SpiderDebug;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -728,7 +730,11 @@ class YTSabrSession {
         String target = url != null ? url
                 : cfg.serverAbrStreamingUrl != null ? cfg.serverAbrStreamingUrl
                 : videoItem != null ? videoItem.url : null;
-        Map<String, String> headers = new HashMap<>();
+        if (target == null || target.indexOf("n=") < 0) {
+            throw new Exception("SABR missing solved server URL");
+        }
+        SpiderDebug.log("YouTube SABR 请求准备: client=" + cfg.clientName + ", videoItag="
+                + videoItag + ", audioItag=" + audioItag + ", rn=" + (requestCount + 1));
         if (videoItem != null && !videoItem.headers.isEmpty()) headers.putAll(videoItem.headers);
         else if (audioItem != null) headers.putAll(audioItem.headers);
 
@@ -741,7 +747,7 @@ class YTSabrSession {
             YTHttp.Result response = http.postSabr(target, payload, headers, rn);
             requestCount = rn;
             lastStatus = response.code;
-            String redirectUrl = null;
+            SpiderDebug.log("YouTube SABR 响应: http=" + response.code + ", rn=" + rn);
             int completed = 0;
             try {
                 if (response.code != 200) {
@@ -751,7 +757,12 @@ class YTSabrSession {
                 if (in == null) throw new Exception("SABR empty body");
                 YTProto.UmpReader reader = new YTProto.UmpReader(in, maxParts);
                 YTProto.UmpPart part;
+                int seenParts = 0;
                 while ((part = reader.next()) != null) {
+                    seenParts++;
+                    if (part.id != YTSabr.MEDIA && part.id != YTSabr.MEDIA_HEADER && part.id != YTSabr.MEDIA_END) {
+                        SpiderDebug.log("YouTube UMP 控制 part=" + part.id + ", bytes=" + part.data.length);
+                    }
                     if (part.id == YTSabr.MEDIA_HEADER) {
                         Long headerId = YTProto.getInt(part.data, 1);
                         if (headerId == null) continue;
@@ -869,7 +880,9 @@ class YTSabrSession {
             } finally {
                 response.close();
             }
-            if (redirectUrl != null && completed == 0) {
+            SpiderDebug.log("YouTube SABR 处理完成: rn=" + requestCount + ", completed=" + completed
+                    + ", initialized=" + initialized.size() + ", videoCached=" + initSegments.containsKey(videoItag)
+                    + ", audioCached=" + initSegments.containsKey(audioItag));
                 target = redirectUrl;
                 // Redirect parts can update the playback cookie/policy. Rebuild from the latest
                 // state instead of resending a stale payload to the new CDN.

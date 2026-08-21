@@ -972,6 +972,9 @@ final class YTPlay {
                 return bytes(200, contentType, found.media, headers);
             } catch (Throwable e) {
                 lastError = String.valueOf(e);
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 取段失败: track=" + track
+                        + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
+                        + ", error=" + lastError);
                 boolean canFailover = init && lastError.contains("SABR HTTP 4");
                 if (!canFailover || switchClient(vid, requestIndex, cacheKey) == null) break;
             }
