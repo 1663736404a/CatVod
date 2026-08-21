@@ -82,19 +82,20 @@ final class YoutubeNsig {
     }
 
     private static String source(String code, int anchor, String factory, String value) {
-        String shim = "var globalThis=globalThis||this;"
-                + "if(typeof globalThis.XMLHttpRequest==='undefined')globalThis.XMLHttpRequest=function(){};"
-                + "globalThis.location={hash:'',host:'www.youtube.com',hostname:'www.youtube.com',href:'https://www.youtube.com/',origin:'https://www.youtube.com',password:'',pathname:'/',port:'',protocol:'https:',search:'',username:''};"
-                + "if(!globalThis.window)globalThis.window=globalThis;"
-                + "if(!globalThis.self)globalThis.self=globalThis;"
-                + "if(!globalThis.document)globalThis.document={};"
-                + "if(!globalThis.navigator)globalThis.navigator={};"
-                + "if(!globalThis.performance)globalThis.performance={};"
-                + "if(!globalThis.sessionStorage)globalThis.sessionStorage={};"
-                + "if(!globalThis.trustedTypes)globalThis.trustedTypes={};"
-                + "if(!globalThis.TextEncoder)globalThis.TextEncoder=function(){this.encode=function(s){var a=[];s=String(s);for(var i=0;i<s.length;i++)a.push(s.charCodeAt(i)&255);return new Uint8Array(a)}};"
-                + "if(!globalThis.TextDecoder)globalThis.TextDecoder=function(){this.decode=function(a){var s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return s}};"
-                + "(function(){function D(){}D.prototype.format=function(){return''};D.prototype.formatToParts=function(){return[]};D.prototype.resolvedOptions=function(){return{timeZone:'UTC',locale:'en-US'}};D.supportedLocalesOf=function(a){return Array.isArray(a)?a.slice():[a]};function N(){}N.prototype.format=function(a){return String(a)};N.prototype.resolvedOptions=function(){return{locale:'en-US'}};N.supportedLocalesOf=D.supportedLocalesOf;function C(){}C.prototype.compare=function(a,b){return a<b?-1:a>b?1:0};C.supportedLocalesOf=D.supportedLocalesOf;globalThis.Intl={DateTimeFormat:D,NumberFormat:N,Collator:C,getCanonicalLocales:D.supportedLocalesOf}})();";";
+        String shim = "var root=(typeof globalThis!=='undefined'?globalThis:this);"
+                + "var globalThis=root;"
+                + "var XMLHttpRequest=root.XMLHttpRequest=function(){};XMLHttpRequest.prototype={};"
+                + "var location=root.location={hash:'',host:'www.youtube.com',hostname:'www.youtube.com',href:'https://www.youtube.com/',origin:'https://www.youtube.com',password:'',pathname:'/',port:'',protocol:'https:',search:'',username:''};"
+                + "var window=root.window=root;"
+                + "var self=root.self=root;"
+                + "var document=root.document={};"
+                + "var navigator=root.navigator={};"
+                + "var performance=root.performance={};"
+                + "var sessionStorage=root.sessionStorage={};"
+                + "var trustedTypes=root.trustedTypes={};"
+                + "var TextEncoder=root.TextEncoder||function(){this.encode=function(s){var a=[];s=String(s);for(var i=0;i<s.length;i++)a.push(s.charCodeAt(i)&255);return new Uint8Array(a)}};"
+                + "var TextDecoder=root.TextDecoder||function(){this.decode=function(a){var s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return s}};"
+                + "(function(){function D(){}D.prototype.format=function(){return''};D.prototype.formatToParts=function(){return[]};D.prototype.resolvedOptions=function(){return{timeZone:'UTC',locale:'en-US'}};D.supportedLocalesOf=function(a){return Array.isArray(a)?a.slice():[a]};function N(){}N.prototype.format=function(a){return String(a)};N.prototype.resolvedOptions=function(){return{locale:'en-US'}};N.supportedLocalesOf=D.supportedLocalesOf;function C(){}C.prototype.compare=function(a,b){return a<b?-1:a>b?1:0};C.supportedLocalesOf=D.supportedLocalesOf;root.Intl={DateTimeFormat:D,NumberFormat:N,Collator:C,getCanonicalLocales:D.supportedLocalesOf}})();";";
         String inject = "globalThis.__solve_n=function(v){var u=" + factory + "('https://youtube.com/watch?v=x','s',undefined);u.set('n',v);var p=Object.getPrototypeOf(u),k=Object.keys(p).concat(Object.getOwnPropertyNames(p));for(var i=0;i<k.length;i++){if(['constructor','set','get','clone'].indexOf(k[i])<0){u[k[i]]();break;}}return u.get('n');};";
         return shim + code.substring(0, anchor) + inject + code.substring(anchor) + ";globalThis.__solve_n(" + quote(value) + ");";
     }
