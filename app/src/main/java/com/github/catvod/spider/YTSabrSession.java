@@ -735,6 +735,7 @@ class YTSabrSession {
         }
         SpiderDebug.log("YouTube SABR 请求准备: client=" + cfg.clientName + ", videoItag="
                 + videoItag + ", audioItag=" + audioItag + ", rn=" + (requestCount + 1));
+        Map<String, String> headers = new HashMap<>();
         if (videoItem != null && !videoItem.headers.isEmpty()) headers.putAll(videoItem.headers);
         else if (audioItem != null) headers.putAll(audioItem.headers);
 
@@ -748,6 +749,7 @@ class YTSabrSession {
             requestCount = rn;
             lastStatus = response.code;
             SpiderDebug.log("YouTube SABR 响应: http=" + response.code + ", rn=" + rn);
+            String redirectUrl = null;
             int completed = 0;
             try {
                 if (response.code != 200) {
