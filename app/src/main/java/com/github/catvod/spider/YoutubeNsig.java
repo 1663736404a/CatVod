@@ -61,7 +61,8 @@ final class YoutubeNsig {
             }
             SpiderDebug.log("YouTube n 解扰成功: factory=" + factory);
             return solved;
-            SpiderDebug.log("YouTube n 解扰异常: " + ignored);
+        } catch (Throwable error) {
+            SpiderDebug.log("YouTube n 解扰异常: " + error);
             return null;
         } finally {
             if (context != null) {
