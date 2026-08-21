@@ -69,7 +69,7 @@ public class YouTube extends Spider {
         this.http = new YTHttp(header, proxyStr);
         this.yt = new YouTubeLite(context, http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
-        this.session = new YoutubeSession(ext);
+        this.session = new YoutubeSession(context, ext);
         this.youtubeProxy = new YoutubeProxy(play);
     }
 
