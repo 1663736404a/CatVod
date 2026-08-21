@@ -8,6 +8,8 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import com.github.catvod.crawler.SpiderDebug;
+
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -31,8 +33,13 @@ final class YoutubeBotGuard {
         CountDownLatch done = new CountDownLatch(1);
         String[] result = new String[1];
         new Handler(Looper.getMainLooper()).post(() -> createWebView(binding, result, done));
-        try { done.await(35, TimeUnit.SECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        try {
+            if (!done.await(35, TimeUnit.SECONDS)) SpiderDebug.log("YouTube BotGuard 失败: webview-timeout");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            SpiderDebug.log("YouTube BotGuard 失败: interrupted");
+        }
+        if (result[0] != null) SpiderDebug.log("YouTube BotGuard 成功: visitor-bound token 已生成");
         return result[0];
     }
 
@@ -46,7 +53,10 @@ final class YoutubeBotGuard {
             web.addJavascriptInterface(new Bridge(result, done, web), "CatVodBotGuard");
             web.setWebViewClient(new WebViewClient());
             web.loadDataWithBaseURL("https://www.youtube.com/", html(binding), "text/html", "UTF-8", null);
-        } catch (Throwable ignored) { done.countDown(); }
+        } catch (Throwable error) {
+            SpiderDebug.log("YouTube BotGuard WebView 创建失败: " + error);
+            done.countDown();
+        }
     }
 
     private static String html(String binding) {
@@ -72,8 +82,8 @@ final class YoutubeBotGuard {
     private static final class Bridge {
         final String[] result; final CountDownLatch done; final WebView web;
         Bridge(String[] result, CountDownLatch done, WebView web) { this.result=result; this.done=done; this.web=web; }
-        @JavascriptInterface public void success(String token) { result[0]=token == null||token.isEmpty()?null:token; finish(); }
-        @JavascriptInterface public void failure(String error) { finish(); }
+        @JavascriptInterface public void success(String token) { result[0]=token == null||token.isEmpty()?null:token; if(result[0]==null) SpiderDebug.log("YouTube BotGuard 失败: empty-token"); finish(); }
+        @JavascriptInterface public void failure(String error) { SpiderDebug.log("YouTube BotGuard JS 失败: " + error); finish(); }
         void finish() { done.countDown(); new Handler(Looper.getMainLooper()).post(web::destroy); }
     }
 }
