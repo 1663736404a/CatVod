@@ -137,32 +137,16 @@ public class YouTube extends Spider {
         String playlistId = YTParse.playlistId(rawId);
         if (!playlistId.isEmpty()) return playlistDetail(playlistId);
         String videoId = rawId.startsWith("v:") ? rawId.substring(2) : rawId;
+        // Detail must remain a metadata operation.  A full player extraction here starts
+        // BotGuard/n-solver work and can occupy the host's 30s detail deadline before playback
+        // even begins.  Live probing and related-video fetching are deliberately left to the
+        // playback/search paths; a single video detail needs only a title and playable id.
         String title = videoTitle(videoId);
         String safeTitle = YTParse.safeTitle(title);
-        boolean isLive = false;
-        try {
-            isLive = yt.extract(videoId).isLive;
-        } catch (Throwable ignored) {
-            // A failed extraction only costs the live marker.
-        }
-        // vod_play_from lines describe where the content comes from:
-        //   Youtube      -> this video itself (single episode)
-        //   Youtube推薦  -> the watch page's related videos
-        // The same-keyword search line was removed: it ran a synchronous search and blocked the
-        // detail page. Quality switching is expressed by playerContent's name/url array instead.
         List<String> playFrom = new ArrayList<>();
         List<String> playUrl = new ArrayList<>();
         playFrom.add("Youtube");
-        playUrl.add(isLive ? safeTitle + " 正在直播$" + videoId + "@live" : safeTitle + "$" + videoId);
-        try {
-            List<String> related = episodes(relatedVideos(videoId), videoId);
-            if (!related.isEmpty()) {
-                playFrom.add("Youtube推薦");
-                playUrl.add(TextUtils.join("#", related));
-            }
-        } catch (Throwable ignored) {
-            // Related videos are optional.
-        }
+        playUrl.add(safeTitle + "$" + videoId);
         Vod vod = new Vod();
         vod.setVodId(videoId);
         vod.setVodName(title);
@@ -242,7 +226,7 @@ public class YouTube extends Spider {
     private String videoTitle(String vid) {
         try {
             String json = http.string("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v="
-                    + Uri.encode(vid) + "&format=json");
+                    + Uri.encode(vid) + "&format=json", null, 5000);
             JsonObject obj = Json.safeObject(json);
             return YouTubeLite.optString(obj, "title", vid);
         } catch (Throwable e) {

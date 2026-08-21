@@ -68,7 +68,10 @@ final class YTPlay {
     /** One compatible SABR client pairing. */
     private static class Candidate {
         String client;
+        /** Highest-ranked representation used as the initial video track. */
         YTFormat video;
+        /** Same-session representations Exo may switch between by bandwidth. */
+        List<YTFormat> videos = new ArrayList<>();
         YTFormat audio;
         String videoSig;
         String audioSig;
@@ -79,6 +82,7 @@ final class YTPlay {
         List<Candidate> candidates = new ArrayList<>();
         int activeIndex;
         YTFormat videoItem;
+        List<YTFormat> videoItems = new ArrayList<>();
         YTFormat audioItem;
         String stateKey;
         long duration;
@@ -138,6 +142,15 @@ final class YTPlay {
 
     private static String low(String text) {
         return text == null ? "" : text.toLowerCase(Locale.US);
+    }
+
+    /** Groups codec strings such as vp09.00.40.08 and vp09.00.50.08 for DASH adaptation. */
+    private static String codecFamily(YTFormat item) {
+        String text = low(item == null ? null : item.codecs);
+        if (text.contains("vp09") || text.contains("vp9")) return "vp9";
+        if (text.contains("av01") || text.contains("av1")) return "av1";
+        if (text.contains("avc") || text.contains("h264")) return "avc";
+        return text;
     }
 
     private static String mimeBase(String mime) {
@@ -503,7 +516,10 @@ final class YTPlay {
                 if (!name.isEmpty() && !out.contains(name)) out.add(name);
             }
         }
-        if (out.isEmpty()) out.add("TVHTML5");
+        // The extractor only accepts TVHTML5 for full-length SABR.  Older site JSON
+        // may still say ANDROID; keep it as a harmless fallback entry but always append
+        // TVHTML5 so a stale configuration cannot make every candidate disappear.
+        if (!out.contains("TVHTML5")) out.add("TVHTML5");
         return out;
     }
 
@@ -536,9 +552,11 @@ final class YTPlay {
         if ("8k".equals(quality) || "8k_hdr".equals(quality)) {
             videos = heights(videos, 4320, Integer.MAX_VALUE);
         } else if ("4k".equals(quality)) {
-            videos = heights(videos, 2160, 4320);
+            // Keep 2160p as the initial choice, but expose 1080p/1440p in the same
+            // adaptation set so Exo can step down when the link cannot sustain 4K.
+            videos = heights(videos, 1080, 2161);
         } else if ("2k".equals(quality)) {
-            videos = heights(videos, 1440, 2160);
+            videos = heights(videos, 1080, 2160);
         } else if ("1080p".equals(quality)) {
             videos = heights(videos, 1000, 1440);
         } else {
@@ -550,8 +568,26 @@ final class YTPlay {
             if (cmp != 0) return -cmp;
             cmp = Integer.compare(b.height, a.height);
             if (cmp != 0) return cmp;
-            cmp = Integer.compare(yt.videoCodecPriority(b), yt.videoCodecPriority(a));
-            if (cmp != 0) return cmp;
+            // For UHD, a 30fps track is a much better Exo starting point than a
+            // 60fps track with nearly twice the bitrate.  Lower bitrate is also
+            // preferred within the same UHD/fps class; adaptive playback can still
+            // move to a higher representation when bandwidth permits.
+            if (a.height >= 2160 && b.height >= 2160) {
+                int aFps = a.fps > 30 ? 1 : 0;
+                int bFps = b.fps > 30 ? 1 : 0;
+                cmp = Integer.compare(aFps, bFps);
+                if (cmp != 0) return cmp;
+                // Keep VP9/H.264 ahead of AV1 on Android even when AV1 happens
+                // to advertise a smaller bitrate.
+                cmp = Integer.compare(yt.videoCodecPriority(b), yt.videoCodecPriority(a));
+                if (cmp != 0) return cmp;
+                cmp = Long.compare(a.bitrate, b.bitrate);
+                if (cmp != 0) return cmp;
+            } else {
+                cmp = Integer.compare(yt.videoCodecPriority(b), yt.videoCodecPriority(a));
+                if (cmp != 0) return cmp;
+                return Long.compare(b.bitrate, a.bitrate);
+            }
             return Long.compare(b.bitrate, a.bitrate);
         };
         videos.sort(order);
@@ -628,9 +664,35 @@ final class YTPlay {
             } else if (!videoSig.equals(primaryVideoSig) || !audioSig.equals(primaryAudioSig)) {
                 continue;
             }
+
+            // Keep every representation from this exact TVHTML5/SABR session that has
+            // the same codec family and SDR/HDR class.  A single 4K representation
+            // makes Exo lock onto (for example) 28 Mbps VP9/60 and leaves it no way
+            // to recover on a 2-3 Mbps link.  These entries become one DASH adaptation
+            // set; the requested itag is carried back to the SABR session per segment.
+            List<YTFormat> adaptive = new ArrayList<>();
+            String mime = low(mimeBase(video.mimeType));
+            String codecs = codecFamily(video);
+            boolean hdr = yt.isHdrVideo(video);
+            Set<Integer> seenItags = new HashSet<>();
+            for (YTFormat item : clientVideos) {
+                YTSabr.Config itemCfg = item.sabrConfig;
+                if (itemCfg == null || !videoCfg.serverAbrStreamingUrl.equals(itemCfg.serverAbrStreamingUrl)) continue;
+                if (!mime.equals(low(mimeBase(item.mimeType))) || !codecs.equals(codecFamily(item))) continue;
+                if (yt.isHdrVideo(item) != hdr || seenItags.contains(item.itag)) continue;
+                seenItags.add(item.itag);
+                adaptive.add(item);
+            }
+            if (adaptive.isEmpty()) adaptive.add(video);
+            adaptive.sort((a, b) -> {
+                int cmp = Integer.compare(a.height, b.height);
+                if (cmp != 0) return cmp;
+                return Long.compare(a.bitrate, b.bitrate);
+            });
             Candidate candidate = new Candidate();
             candidate.client = client;
             candidate.video = video;
+            candidate.videos = adaptive;
             candidate.audio = audio;
             candidate.videoSig = videoSig;
             candidate.audioSig = audioSig;
@@ -648,6 +710,9 @@ final class YTPlay {
         }
         data.activeIndex = index;
         data.videoItem = selected.video;
+        data.videoItems = selected.videos == null || selected.videos.isEmpty()
+                ? new ArrayList<>(Collections.singletonList(selected.video))
+                : new ArrayList<>(selected.videos);
         data.audioItem = selected.audio;
         data.stateKey = stateKey;
         sabrCache.put(cacheKey == null ? "yt_sabr_" + vid : cacheKey, data);
@@ -726,29 +791,57 @@ final class YTPlay {
         YTFormat audio = data.audioItem;
         long duration = data.duration;
         String base = localUrl("&type=sabr&vid=" + enc(vid) + "&quality=" + enc(quality));
-        long videoSegMs = (long) ((video.sabrConfig == null ? 6 : video.sabrConfig.targetDurationSec) * 1000);
-        if (videoSegMs <= 0) videoSegMs = 6000;
-        long audioSegMs = (long) ((audio.sabrConfig == null ? 10 : audio.sabrConfig.targetDurationSec) * 1000);
-        if (audioSegMs < 8000) audioSegMs = 10000;
-        List<YTFormat.Seg> videoTimeline = loadTimeline(video, duration * 1000);
-        List<YTFormat.Seg> audioTimeline = loadTimeline(audio, duration * 1000);
-        String videoRows = YTIndex.segmentTimelineXml(videoTimeline);
-        String audioRows = YTIndex.segmentTimelineXml(audioTimeline);
-        if (videoRows.isEmpty()) videoRows = evenRows(duration * 1000, videoSegMs);
-        if (audioRows.isEmpty()) audioRows = evenRows(duration * 1000, audioSegMs);
+        List<YTFormat> videos = data.videoItems == null || data.videoItems.isEmpty()
+                ? new ArrayList<>(Collections.singletonList(video)) : data.videoItems;
         StringBuilder mpd = new StringBuilder();
         mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
                 .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
                 .append(duration).append("S\" minBufferTime=\"PT10S\" ")
                 .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
                 .append("  <Period id=\"1\" start=\"PT0S\">\n")
-                .append(templateSet(video, base, "video", videoRows, true))
-                .append(templateSet(audio, base, "audio", audioRows, false))
+                .append(templateVideoSet(videos, base, duration * 1000))
+                .append(templateSet(audio, base, "audio", duration * 1000, false))
                 .append("  </Period>\n</MPD>");
         return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
     }
 
-    private String templateSet(YTFormat item, String base, String track, String rows, boolean video) {
+    /** One adaptive video set; each representation stays in the same SABR session. */
+    private String templateVideoSet(List<YTFormat> items, String base, long totalMs) {
+        if (items == null || items.isEmpty()) return "";
+        YTFormat first = items.get(0);
+        StringBuilder sb = new StringBuilder();
+        sb.append("    <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"")
+                .append(esc(mimeBase(fallback(first.mimeType, "video/webm"))))
+                .append("\" segmentAlignment=\"true\" startWithSAP=\"1\">\n");
+        for (YTFormat item : items) {
+            long segMs = (long) ((item.sabrConfig == null ? 6 : item.sabrConfig.targetDurationSec) * 1000);
+            if (segMs <= 0) segMs = 6000;
+            List<YTFormat.Seg> timeline = loadTimeline(item, totalMs);
+            String rows = YTIndex.segmentTimelineXml(timeline);
+            if (rows.isEmpty()) rows = evenRows(totalMs, segMs);
+            sb.append("      <Representation id=\"sabr-v").append(item.itag)
+                    .append("\" bandwidth=\"").append(item.bitrate == 0 ? 1000000 : item.bitrate)
+                    .append("\" codecs=\"").append(esc(item.codecs)).append("\" width=\"")
+                    .append(item.width).append("\" height=\"").append(item.height);
+            if (item.fps > 0) sb.append(" frameRate=\"").append(item.fps).append("/1\"");
+            sb.append(">\n")
+                    .append("        <SegmentTemplate timescale=\"1000\" startNumber=\"1\" initialization=\"")
+                    .append(esc(base + "&track=video&itag=" + item.itag + "&seg=init")).append("\" media=\"")
+                    .append(esc(base + "&track=video&itag=" + item.itag + "&seg=")).append("$Number$\">")
+                    .append("<SegmentTimeline>").append(rows).append("</SegmentTimeline></SegmentTemplate>\n")
+                    .append("      </Representation>\n");
+        }
+        return sb.append("    </AdaptationSet>\n").toString();
+    }
+
+    private String templateSet(YTFormat item, String base, String track, long totalMs, boolean video) {
+        if (item == null) return "";
+        long segMs = (long) ((item.sabrConfig == null ? (video ? 6 : 10) : item.sabrConfig.targetDurationSec) * 1000);
+        if (video && segMs <= 0) segMs = 6000;
+        if (!video && segMs < 8000) segMs = 10000;
+        List<YTFormat.Seg> timeline = loadTimeline(item, totalMs);
+        String rows = YTIndex.segmentTimelineXml(timeline);
+        if (rows.isEmpty()) rows = evenRows(totalMs, segMs);
         StringBuilder sb = new StringBuilder();
         sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"").append(track)
                 .append("\" mimeType=\"").append(esc(mimeBase(fallback(item.mimeType, video ? "video/webm" : "audio/webm"))))
@@ -951,10 +1044,26 @@ final class YTPlay {
             if (current != null) data = current;
             int requestIndex = data.activeIndex;
             String stateKey = data.stateKey == null ? vid + ":sabr" : data.stateKey;
-            YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
+            YTFormat requestedVideo = data.videoItem;
+            if ("video".equals(track) && params.get("itag") != null) {
+                try {
+                    int requestedItag = Integer.parseInt(params.get("itag"));
+                    if (data.videoItems != null) {
+                        for (YTFormat candidate : data.videoItems) {
+                            if (candidate != null && candidate.itag == requestedItag) {
+                                requestedVideo = candidate;
+                                break;
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // Keep the initial representation when the player sends a malformed itag.
+                }
+            }
+            YTFormat item = "video".equals(track) ? requestedVideo : data.audioItem;
             try {
                 YTSabrSession.Found found = session(stateKey)
-                        .getSegment(data.videoItem, data.audioItem, track, segment);
+                        .getSegment(requestedVideo, data.audioItem, track, segment);
                 if (found == null || found.media == null) {
                     lastError = found == null ? "empty response" : found.error;
                     if (init && switchClient(vid, requestIndex, cacheKey) != null) continue;

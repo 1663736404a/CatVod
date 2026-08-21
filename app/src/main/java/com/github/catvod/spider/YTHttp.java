@@ -116,7 +116,23 @@ final class YTHttp {
     }
 
     String string(String url, Map<String, String> headers) {
-        try (Response response = client.newCall(request(url, headers).build()).execute()) {
+        return string(url, headers, 0);
+    }
+
+    /**
+     * Fetches text with an optional per-call deadline.
+     *
+     * <p>Metadata endpoints must not hold a CatVod detail request for the full media timeout.
+     * A cloned client shares the connection pool but applies a short call timeout only to this
+     * request, so slow or blocked oEmbed/watch metadata degrades to the video id instead of making
+     * the detail page appear empty.
+     */
+    String string(String url, Map<String, String> headers, long timeoutMs) {
+        OkHttpClient active = client;
+        if (timeoutMs > 0) {
+            active = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build();
+        }
+        try (Response response = active.newCall(request(url, headers).build()).execute()) {
             if (response.body() == null) return "";
             return response.body().string();
         } catch (Throwable e) {
