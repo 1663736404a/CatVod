@@ -165,10 +165,22 @@ class YouTubeLite {
         }
 
         JsonObject best = null;
+        // TVHTML5 is the only client in this implementation that is allowed to supply the
+        // full-length SABR response. Do not let the watch-page WEB_INITIAL response win merely
+        // because it appears first in the list.
         for (JsonObject response : responses) {
-            if ("OK".equals(traverseString(response, "playabilityStatus", "status"))) {
+            if ("TVHTML5".equals(optString(response, "_client_name", ""))
+                    && "OK".equals(traverseString(response, "playabilityStatus", "status"))) {
                 best = response;
                 break;
+            }
+        }
+        if (best == null) {
+            for (JsonObject response : responses) {
+                if ("OK".equals(traverseString(response, "playabilityStatus", "status"))) {
+                    best = response;
+                    break;
+                }
             }
         }
         if (best == null) best = initialPr == null ? new JsonObject() : initialPr;
@@ -285,24 +297,18 @@ class YouTubeLite {
     private List<JsonObject> callPlayerApi(String videoId, String apiKey, JsonObject webContext,
                                            String referer, String visitorData, Integer sts) {
         List<JsonObject> clients = new ArrayList<>();
-        clients.add(clientContext("{\"client\":{\"clientName\":\"ANDROID_VR\",\"clientVersion\":\"1.65.10\","
-                + "\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32,"
-                + "\"userAgent\":\"com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; "
-                + "eureka-user Build/SQ3A.220605.009.A1) gzip\",\"osName\":\"Android\",\"osVersion\":\"12L\","
-                + "\"hl\":\"en\",\"gl\":\"US\"}}"));
-        clients.add(clientContext("{\"client\":{\"clientName\":\"ANDROID\",\"clientVersion\":\"21.02.35\","
-                + "\"androidSdkVersion\":30,\"userAgent\":\"com.google.android.youtube/21.02.35 "
-                + "(Linux; U; Android 11) gzip\",\"osName\":\"Android\",\"osVersion\":\"11\","
-                + "\"hl\":\"en\",\"gl\":\"US\"}}"));
-        clients.add(clientContext("{\"client\":{\"clientName\":\"IOS\",\"clientVersion\":\"21.02.3\","
-                + "\"deviceMake\":\"Apple\",\"deviceModel\":\"iPhone16,2\","
-                + "\"userAgent\":\"com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)\","
-                + "\"osName\":\"iPhone\",\"osVersion\":\"18.3.2.22D82\",\"hl\":\"en\",\"gl\":\"US\"}}"));
-        if (webContext != null) clients.add(webContext);
-        clients.add(clientContext("{\"client\":{\"clientName\":\"MWEB\",\"clientVersion\":\"2.20260115.01.00\","
-                + "\"userAgent\":\"Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 "
-                + "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)\","
-                + "\"hl\":\"en\",\"gl\":\"US\"}}"));
+        String version = optString(config, "tvhtml5_client_version", "7.20250312.16.00");
+        String ua = optString(config, "tvhtml5_user_agent", "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
+                + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15");
+        JsonObject tv = new JsonObject();
+        JsonObject tvClient = new JsonObject();
+        tvClient.addProperty("clientName", "TVHTML5");
+        tvClient.addProperty("clientVersion", version);
+        tvClient.addProperty("userAgent", ua);
+        tvClient.addProperty("hl", "en");
+        tvClient.addProperty("gl", "US");
+        tv.add("client", tvClient);
+        clients.add(tv);
 
         List<JsonObject> results = new ArrayList<>();
         for (JsonObject ctx : clients) {
@@ -324,8 +330,15 @@ class YouTubeLite {
                 payload.add("playbackContext", playbackCtx);
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
+                String token = poToken(clientName);
+                if (!TextUtils.isEmpty(token)) {
+                    JsonObject integrity = new JsonObject();
+                    integrity.addProperty("poToken", token);
+                    payload.add("serviceIntegrityDimensions", integrity);
+                }
 
                 Map<String, String> reqHeaders = new HashMap<>();
+                reqHeaders.put("Origin", "https://www.youtube.com");
                 reqHeaders.put("Referer", referer);
                 reqHeaders.put("X-YouTube-Client-Name", String.valueOf(clientNameId(clientName)));
                 reqHeaders.put("X-YouTube-Client-Version", optString(client, "clientVersion", ""));
@@ -371,8 +384,11 @@ class YouTubeLite {
     private void extractFormats(List<JsonObject> responses, String playerUrl, Extracted out) {
         Set<String> seenDirect = new HashSet<>();
         Set<String> seenSabr = new HashSet<>();
+        // Keep watch-page metadata, but only accept SABR representations from the TVHTML5
+        // player response. Mixing WEB/ANDROID entries here breaks the TVHTML5-bound session.
         for (JsonObject response : responses) {
             if (response == null) continue;
+            if (!"TVHTML5".equals(optString(response, "_client_name", ""))) continue;
             JsonObject sd = traverseObject(response, "streamingData");
             if (sd == null) continue;
             List<JsonObject> rawList = new ArrayList<>();
