@@ -487,8 +487,7 @@ final class YTPlay {
     /**
      * SABR client polling order.
      *
-     * <p>ANDROID is the only client verified in this environment; the others answer 403 and must
-     * not be polled unless the config asks for them. WEB/WEB_INITIAL are deliberately excluded.
+     * <p>TVHTML5 is the only client used by this full-length SABR path.
      */
     private List<String> clientPriority() {
         List<String> out = new ArrayList<>();
@@ -504,7 +503,7 @@ final class YTPlay {
                 if (!name.isEmpty() && !out.contains(name)) out.add(name);
             }
         }
-        if (out.isEmpty()) out.add("ANDROID");
+        if (out.isEmpty()) out.add("TVHTML5");
         return out;
     }
 
@@ -657,7 +656,11 @@ final class YTPlay {
 
     private SabrData newSabrData(String vid, YouTubeLite.Extracted extracted, String quality, String cacheKey) {
         List<Candidate> candidates = buildCandidates(extracted.sabrFormats, quality);
-        if (candidates.isEmpty()) return null;
+        if (candidates.isEmpty()) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube TVHTML5 SABR 候选为空: formats="
+                    + extracted.sabrFormats.size() + ", quality=" + quality);
+            return null;
+        }
         SabrData data = new SabrData();
         data.candidates = candidates;
         data.duration = extracted.duration;
