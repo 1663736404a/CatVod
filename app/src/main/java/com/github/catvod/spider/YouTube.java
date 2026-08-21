@@ -23,21 +23,15 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * YouTube catalog source with host-WebView playback.
+ * YouTube catalog source with JAR-owned SABR playback.
  *
- * <p>Browsing (home/category/search/detail) runs on InnerTube JSON. Playback returns a
- * {@code parse=1} result so the host WebView loads YouTube's own player: the spider cannot see the
- * WebView's googlevideo requests, so the host has to sniff them.
- *
- * <p>The local DASH bridges in {@link YTPlay} stay reachable through {@link #proxy(Map)} for
- * manifests that were handed out earlier, but {@link #playerContent} no longer builds them.
+ * <p>Browsing runs on InnerTube JSON. Playback returns a local DASH URL and all media requests
+ * are handled by this JAR's {@link #proxy(Map)} implementation.
  */
 public class YouTube extends Spider {
 
     private static final String CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    private static final String MOBILE_UA = "Mozilla/5.0 (Linux; Android 12) "
-            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
     private static final String DEFAULT_CLIENT_VERSION = "2.20240310.01.00";
     private static final long PLAYLIST_CACHE_MS = 1200 * 1000L;
 
@@ -175,10 +169,11 @@ public class YouTube extends Spider {
     }
 
     /**
-     * Always hands playback to the host WebView.
+     * Starts playback through the JAR-owned SABR bridge.
      *
-     * <p>{@code parse=1} makes FongMi open the page and sniff the media requests itself, which is
-     * the only way anonymous YouTube playback works reliably.
+     * <p>The old implementation returned {@code parse=1} and handed the watch page to the host
+     * WebView. The player now receives a local DASH URL; SegmentBase requests return to
+     * {@link #proxy(Map)}, where {@link YTPlay} performs SABR.
      */
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) {
@@ -187,54 +182,10 @@ public class YouTube extends Spider {
         String videoId = rawPid;
         int at = rawPid.lastIndexOf('@');
         if (at > 0) videoId = rawPid.substring(0, at);
-        Map<String, String> headers = new HashMap<>();
-        // A mobile browser UA keeps the anonymous watch page on the HTML5 player.
-        headers.put("User-Agent", YouTubeLite.optString(ext, "webview_ua", MOBILE_UA));
-        headers.put("Referer", "https://www.youtube.com/");
-        headers.put("Accept-Language", header.get("Accept-Language"));
-        Result result = Result.get().parse().url(webviewUrl(videoId)).header(headers);
-        return result.string();
-    }
-
-    /** The page the host WebView loads so YouTube's own player runs. */
-    private String webviewUrl(String videoId) {
-        String mode = YouTubeLite.optString(ext, "webview_page", "watch").toLowerCase();
-        JsonObject custom = YouTubeLite.traverseObject(ext, "webview_embed_params");
-        if ("embed".equals(mode)) {
-            Map<String, String> params = new LinkedHashMap<>();
-            params.put("autoplay", "1");
-            params.put("playsinline", "1");
-            params.put("rel", "0");
-            params.put("modestbranding", "1");
-            putCustom(params, custom);
-            String host = YouTubeLite.optBool(ext, "webview_nocookie")
-                    ? "www.youtube-nocookie.com" : "www.youtube.com";
-            return "https://" + host + "/embed/" + videoId + "?" + query(params);
-        }
-        // Default: the anonymous watch page, which plays without login.
-        Map<String, String> params = new LinkedHashMap<>();
-        params.put("v", videoId);
-        putCustom(params, custom);
-        String host = YouTubeLite.optString(ext, "webview_host", "m.youtube.com");
-        return "https://" + host + "/watch?" + query(params);
-    }
-
-    private static void putCustom(Map<String, String> params, JsonObject custom) {
-        if (custom == null) return;
-        for (String key : custom.keySet()) {
-            JsonElement value = custom.get(key);
-            if (value == null || value.isJsonNull()) continue;
-            params.put(key, value.isJsonPrimitive() ? value.getAsString() : value.toString());
-        }
-    }
-
-    private static String query(Map<String, String> params) {
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> entry : params.entrySet()) {
-            if (sb.length() > 0) sb.append('&');
-            sb.append(Uri.encode(entry.getKey())).append('=').append(Uri.encode(entry.getValue()));
-        }
-        return sb.toString();
+        String quality = YouTubeLite.optString(ext, "quality", "best");
+        String url = Proxy.getUrl(siteKey, "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
+                + "&quality=" + Uri.encode(quality));
+        return Result.get().url(url).dash().string();
     }
 
     @Override
