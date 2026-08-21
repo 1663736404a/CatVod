@@ -885,6 +885,7 @@ class YTSabrSession {
             SpiderDebug.log("YouTube SABR 处理完成: rn=" + requestCount + ", completed=" + completed
                     + ", initialized=" + initialized.size() + ", videoCached=" + initSegments.containsKey(videoItag)
                     + ", audioCached=" + initSegments.containsKey(audioItag));
+            if (redirectUrl != null && completed == 0) {
                 target = redirectUrl;
                 // Redirect parts can update the playback cookie/policy. Rebuild from the latest
                 // state instead of resending a stale payload to the new CDN.
