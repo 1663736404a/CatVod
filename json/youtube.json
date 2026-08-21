@@ -4,7 +4,7 @@
   "webview_nocookie": false,
   "playlist_max_items": 500,
   "extract_cache_ttl": 300,
-  "sabr_clients": "TVHTML5",
+  "sabr_clients": "ANDROID",
   "sabr_skip_itags": [337, 401],
   "sabr_max_parts": 4096,
   "sabr_segment_fetch_requests": 10,

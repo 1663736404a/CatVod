@@ -137,10 +137,8 @@ public class YouTube extends Spider {
         String playlistId = YTParse.playlistId(rawId);
         if (!playlistId.isEmpty()) return playlistDetail(playlistId);
         String videoId = rawId.startsWith("v:") ? rawId.substring(2) : rawId;
-        // Detail must remain a metadata operation.  A full player extraction here starts
-        // BotGuard/n-solver work and can occupy the host's 30s detail deadline before playback
-        // even begins.  Live probing and related-video fetching are deliberately left to the
-        // playback/search paths; a single video detail needs only a title and playable id.
+        // Detail is metadata-only. Avoid player/BotGuard/related-video work here so a
+        // slow YouTube response cannot consume the host detail timeout.
         String title = videoTitle(videoId);
         String safeTitle = YTParse.safeTitle(title);
         List<String> playFrom = new ArrayList<>();
