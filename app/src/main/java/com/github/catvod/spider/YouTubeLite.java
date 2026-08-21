@@ -102,11 +102,11 @@ class YouTubeLite {
     /** SABR session state, keyed by {@code vid:client:videoItag:audioItag}. */
     final Map<String, YTSabrSession> sabrState = new HashMap<>();
 
-    YouTubeLite(YTHttp http, Map<String, String> headers, JsonObject config) {
+    YouTubeLite(android.content.Context context, YTHttp http, Map<String, String> headers, JsonObject config) {
         this.http = http;
         this.headers = headers == null ? new HashMap<>() : headers;
         this.config = config == null ? new JsonObject() : config;
-        this.session = new YoutubeSession(this.config);
+        this.session = new YoutubeSession(context, this.config);
         this.extractCacheTtl = optLong(this.config, "extract_cache_ttl", 300);
     }
 
@@ -390,6 +390,11 @@ class YouTubeLite {
             String clientUa = optString(response, "_client_ua", null);
             JsonObject clientInfo = traverseObject(response, "_client_info");
             String serverAbrUrl = optString(sd, "serverAbrStreamingUrl", null);
+            if (YoutubeNsig.needsSolve(serverAbrUrl)) {
+                String rawN = Uri.parse(serverAbrUrl).getQueryParameter("n");
+                String solvedN = YoutubeNsig.solve(playerCode(playerUrl), rawN);
+                serverAbrUrl = YoutubeNsig.replace(serverAbrUrl, solvedN);
+            }
             String ustreamerConfig = traverseString(response, "playerConfig", "mediaCommonConfig",
                     "mediaUstreamerRequestConfig", "videoPlaybackUstreamerConfig");
 
@@ -509,7 +514,7 @@ class YouTubeLite {
         if (clientUa != null) item.headers.put("User-Agent", clientUa);
 
         YTSabr.Config cfg = new YTSabr.Config();
-        cfg.serverAbrStreamingUrl = serverAbrUrl;
+        cfg.serverAbrStreamingUrl = item.url;
         cfg.videoPlaybackUstreamerConfig = ustreamerConfig;
         cfg.clientName = clientName;
         cfg.clientInfo = toClientInfo(clientInfoJson, clientName, clientUa);
@@ -518,6 +523,11 @@ class YouTubeLite {
         cfg.xtags = optString(fmt, "xtags", null);
         cfg.lastModified = optString(fmt, "lastModified", null);
         cfg.targetDurationSec = optLong(fmt, "targetDurationSec", 0);
+        String error = YoutubeSabr.validate(cfg);
+        if (error != null) {
+            SpiderDebug.log("YouTube TVHTML5 SABR 条件失败: " + error);
+            return null;
+        }
         item.sabrConfig = cfg;
         return item;
     }

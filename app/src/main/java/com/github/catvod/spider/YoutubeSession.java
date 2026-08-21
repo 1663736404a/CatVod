@@ -9,9 +9,9 @@ final class YoutubeSession {
     String visitorData;
     Integer signatureTimestamp;
 
-    YoutubeSession(JsonObject config) {
+    YoutubeSession(android.content.Context context, JsonObject config) {
         poTokens = new YoutubePoToken(config);
-        botGuard = new YoutubeBotGuard(poTokens);
+        botGuard = new YoutubeBotGuard(context, poTokens);
     }
 
     void bind(String visitorData, Integer signatureTimestamp) {
