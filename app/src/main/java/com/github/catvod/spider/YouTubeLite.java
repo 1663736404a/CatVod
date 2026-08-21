@@ -393,6 +393,10 @@ class YouTubeLite {
             if (YoutubeNsig.needsSolve(serverAbrUrl)) {
                 String rawN = Uri.parse(serverAbrUrl).getQueryParameter("n");
                 String solvedN = YoutubeNsig.solve(playerCode(playerUrl), rawN);
+                if (TextUtils.isEmpty(solvedN)) {
+                    SpiderDebug.log("YouTube TVHTML5 SABR 丢弃: n 解扰失败");
+                    continue;
+                }
                 serverAbrUrl = YoutubeNsig.replace(serverAbrUrl, solvedN);
             }
             String ustreamerConfig = traverseString(response, "playerConfig", "mediaCommonConfig",

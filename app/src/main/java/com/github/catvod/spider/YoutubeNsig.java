@@ -2,6 +2,8 @@ package com.github.catvod.spider;
 
 import android.text.TextUtils;
 
+import com.github.catvod.crawler.SpiderDebug;
+
 import java.lang.reflect.Method;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -9,8 +11,10 @@ import java.util.regex.Pattern;
 /** Solves TVHTML5 serverAbrStreamingUrl n with the host QuickJS runtime. */
 final class YoutubeNsig {
     private static final Pattern[] FACTORIES = new Pattern[]{
-            Pattern.compile("([\\w$]+)\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{[^{}]{0,240}?set\\(\\\"alr\\\",\\\"yes\\\"\\)"),
-            Pattern.compile("function\\s+([\\w$]+)\\s*\\([^)]*\\)\\s*\\{[^{}]{0,240}?set\\(\\\"alr\\\",\\\"yes\\\"\\)")
+            Pattern.compile("([\\w$]+)\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{[^{}]{0,400}?\\.set\\(\\\"alr\\\",\\\"yes\\\"\\)"),
+            Pattern.compile("function\\s+([\\w$]+)\\s*\\([^)]*\\)\\s*\\{[^{}]{0,400}?\\.set\\(\\\"alr\\\",\\\"yes\\\"\\)"),
+            Pattern.compile("([\\w$]+)\\s*=\\s*function\\s*\\([^)]*\\)\\s*\\{[^{}]{0,400}\\\"alr\\\""),
+            Pattern.compile("function\\s+([\\w$]+)\\s*\\([^)]*\\)\\s*\\{[^{}]{0,400}\\\"alr\\\"")
     };
 
     private YoutubeNsig() {}
@@ -36,7 +40,10 @@ final class YoutubeNsig {
     static String solve(String playerCode, String value) {
         if (TextUtils.isEmpty(playerCode) || TextUtils.isEmpty(value)) return null;
         String factory = factory(playerCode);
-        if (factory == null) return null;
+        if (factory == null) {
+            SpiderDebug.log("YouTube n 解扰失败: 未找到 alr URL 工厂");
+            return null;
+        }
         int anchor = Math.max(playerCode.lastIndexOf("})(_yt_player);"), playerCode.lastIndexOf("}).call(this);"));
         if (anchor < 0) return null;
         Object context = null;
@@ -47,8 +54,14 @@ final class YoutubeNsig {
             context = type.getMethod("create").invoke(null);
             Method evaluate = type.getMethod("evaluate", String.class);
             Object result = evaluate.invoke(context, source(playerCode, anchor, factory, value));
-            return result == null ? null : String.valueOf(result);
-        } catch (Throwable ignored) {
+            String solved = result == null ? null : String.valueOf(result);
+            if (TextUtils.isEmpty(solved) || solved.equals(value)) {
+                SpiderDebug.log("YouTube n 解扰失败: QuickJS 返回无效值");
+                return null;
+            }
+            SpiderDebug.log("YouTube n 解扰成功: factory=" + factory);
+            return solved;
+            SpiderDebug.log("YouTube n 解扰异常: " + ignored);
             return null;
         } finally {
             if (context != null) {
