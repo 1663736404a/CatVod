@@ -183,7 +183,7 @@ public class YouTube extends Spider {
         int at = rawPid.lastIndexOf('@');
         if (at > 0) videoId = rawPid.substring(0, at);
         String quality = YouTubeLite.optString(ext, "quality", "best");
-        String url = Proxy.getUrl(siteKey, "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
+        String url = Proxy.getUrl(siteKey, "&type=sabr_mpd&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality));
         return Result.get().url(url).dash().string();
     }
