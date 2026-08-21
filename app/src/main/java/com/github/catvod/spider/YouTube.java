@@ -40,6 +40,8 @@ public class YouTube extends Spider {
     private YTHttp http;
     private YouTubeLite yt;
     private YTPlay play;
+    private YoutubeSession session;
+    private YoutubeProxy youtubeProxy;
     private String proxyStr;
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
@@ -67,6 +69,8 @@ public class YouTube extends Spider {
         this.http = new YTHttp(header, proxyStr);
         this.yt = new YouTubeLite(http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
+        this.session = new YoutubeSession(ext);
+        this.youtubeProxy = new YoutubeProxy(play);
     }
 
     /** Reads the {@code proxy} extend value, accepting either a bare host:port or an object. */
@@ -190,7 +194,7 @@ public class YouTube extends Spider {
 
     @Override
     public Object[] proxy(Map<String, String> params) {
-        return play.proxy(params);
+        return youtubeProxy.handle(params);
     }
 
     @Override

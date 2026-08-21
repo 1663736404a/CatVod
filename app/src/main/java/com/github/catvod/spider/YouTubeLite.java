@@ -92,6 +92,7 @@ class YouTubeLite {
     private final YTHttp http;
     private final Map<String, String> headers;
     private final JsonObject config;
+    private final YoutubeSession session;
     private final Map<String, String> playerCache = new HashMap<>();
     private final Map<String, Extracted> extractCacheData = new HashMap<>();
     private final Map<String, CacheEntry> extractCache = new HashMap<>();
@@ -105,6 +106,7 @@ class YouTubeLite {
         this.http = http;
         this.headers = headers == null ? new HashMap<>() : headers;
         this.config = config == null ? new JsonObject() : config;
+        this.session = new YoutubeSession(this.config);
         this.extractCacheTtl = optLong(this.config, "extract_cache_ttl", 300);
     }
 
@@ -137,8 +139,9 @@ class YouTubeLite {
         JsonObject initialPr = extractJsonAfter(page, "ytInitialPlayerResponse");
         String playerUrl = extractPlayerUrl(page);
         String apiKey = optString(ytcfg, "INNERTUBE_API_KEY", search(RE_API_KEY, page));
-        String visitorData = extractVisitorData(ytcfg, initialPr);
+        String visitorData = YoutubeVisitor.resolve(config, ytcfg, initialPr);
         Integer sts = extractSignatureTimestamp(playerUrl);
+        session.bind(visitorData, sts);
 
         JsonObject context = ytcfg.has("INNERTUBE_CONTEXT")
                 ? ytcfg.getAsJsonObject("INNERTUBE_CONTEXT")
@@ -272,18 +275,7 @@ class YouTubeLite {
     }
 
     private String poToken(String clientName) {
-        JsonElement tokens = config.has("po_token") ? config.get("po_token")
-                : config.has("po_tokens") ? config.get("po_tokens") : null;
-        if (tokens == null) return null;
-        if (tokens.isJsonPrimitive()) return tokens.getAsString();
-        if (tokens.isJsonObject()) {
-            JsonObject obj = tokens.getAsJsonObject();
-            String key = clientName + ".gvs";
-            if (obj.has(key)) return obj.get(key).getAsString();
-            if (clientName != null && obj.has(clientName)) return obj.get(clientName).getAsString();
-            if (obj.has("gvs")) return obj.get("gvs").getAsString();
-        }
-        return null;
+        return YoutubePlayer.CLIENT.equals(clientName) ? session.poToken() : null;
     }
 
     /* ------------------------------------------------------------------ */
