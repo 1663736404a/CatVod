@@ -3,7 +3,9 @@ package com.github.catvod.spider;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Builders for {@code VideoPlaybackAbrRequest} and its nested messages.
@@ -153,7 +155,8 @@ final class YTSabr {
      * active are replayed.
      */
     static byte[] buildStreamerContext(ClientInfo clientInfo, String poToken, byte[] playbackCookie,
-                                       Map<Integer, SabrContext> sabrContexts) {
+                                       Map<Integer, SabrContext> sabrContexts,
+                                       Set<Integer> unsentContexts) {
         byte[] p = YTProto.pbMsg(1, buildClientInfo(clientInfo));
         byte[] pot = poToken == null ? null : YTProto.b64urlDecode(poToken);
         if (pot != null && pot.length > 0) p = YTProto.concat(p, YTProto.pbBytes(2, pot));
@@ -171,6 +174,15 @@ final class YTSabr {
                 p = YTProto.concat(p, YTProto.pbMsg(5, body));
             }
         }
+        // googlevideo sends StreamerContext.unsentSabrContexts as packed int32 field 6.
+        // Tell the server which previously announced contexts are intentionally omitted.
+        if (unsentContexts != null && !unsentContexts.isEmpty()) {
+            byte[] packed = YTProto.EMPTY;
+            for (Integer type : new TreeSet<>(unsentContexts)) {
+                packed = YTProto.concat(packed, YTProto.varint(type == null ? 0 : type));
+            }
+            p = YTProto.concat(p, YTProto.pbBytes(6, packed));
+        }
         return p;
     }
 
@@ -181,7 +193,8 @@ final class YTSabr {
      */
     static byte[] buildVpabrRequest(Config cfg, Integer videoItag, Integer audioItag, long startTimeMs,
                                     byte[] playbackCookie, List<byte[]> initializedFormatIds,
-                                    List<byte[]> bufferedRanges, Map<Integer, SabrContext> sabrContexts) {
+                                    List<byte[]> bufferedRanges, Map<Integer, SabrContext> sabrContexts,
+                                    Set<Integer> unsentContexts) {
         ClientInfo clientInfo = cfg.clientInfo == null ? new ClientInfo() : cfg.clientInfo;
         int clientNameId = clientInfo.clientNameId == 0 ? 1 : clientInfo.clientNameId;
         boolean audioOnly = videoItag == null || videoItag == 0;
@@ -206,7 +219,7 @@ final class YTSabr {
             p = YTProto.concat(p, YTProto.pbMsg(17, buildFormatId(videoItag, cfg.lastModified, cfg.xtags)));
         }
         p = YTProto.concat(p, YTProto.pbMsg(19,
-                buildStreamerContext(clientInfo, cfg.poToken, playbackCookie, sabrContexts)));
+                buildStreamerContext(clientInfo, cfg.poToken, playbackCookie, sabrContexts, unsentContexts)));
         return p;
     }
 

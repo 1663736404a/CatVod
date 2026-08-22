@@ -133,6 +133,8 @@ class YTSabrSession {
     private final Map<Integer, Map<Integer, Integer>> localSegmentMap = new HashMap<>();
     private final Map<Integer, YTSabr.SabrContext> sabrContexts = new HashMap<>();
     private final Set<Integer> activeContexts = new HashSet<>();
+    /** Server-advertised delay before the next SABR request. */
+    private volatile long backoffUntilMs;
 
     private final YTHttp http;
     private final int maxParts;
@@ -1205,6 +1207,24 @@ class YTSabrSession {
         return out;
     }
 
+    /** Contexts retained locally but not active in the current request. */
+    private Set<Integer> unsentContexts() {
+        if (sabrContexts.isEmpty()) return null;
+        Set<Integer> out = new HashSet<>();
+        for (Integer type : sabrContexts.keySet()) {
+            if (!activeContexts.contains(type)) out.add(type);
+        }
+        return out;
+    }
+
+    private void respectBackoff() throws InterruptedException {
+        long waitMs = backoffUntilMs - System.currentTimeMillis();
+        if (waitMs > 0) {
+            SpiderDebug.log("YouTube SABR 遵守服务端退避: " + waitMs + "ms");
+            Thread.sleep(Math.min(waitMs, 30000L));
+        }
+    }
+
     /**
      * Resets to a target time: clears buffered ranges and initialized ids so the server resends
      * from {@code seekMs}. Already-downloaded segments stay cached; a seek only changes where the
@@ -1237,8 +1257,9 @@ class YTSabrSession {
         Integer audioItag = audioItem == null || audioItem.itag == 0 ? null : audioItem.itag;
         List<byte[]> initializedIds = new ArrayList<>(initialized.values());
         List<byte[]> ranges = bufferedRanges();
+        respectBackoff();
         byte[] payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
-                playbackCookie, initializedIds, ranges, activeContexts());
+                playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
         String target = url != null ? url
                 : cfg.serverAbrStreamingUrl != null ? cfg.serverAbrStreamingUrl
                 : videoItem != null ? videoItem.url : null;
@@ -1342,6 +1363,12 @@ class YTSabrSession {
                         }
                         completed++;
                     } else if (part.id == YTSabr.NEXT_REQUEST_POLICY) {
+                        // NextRequestPolicy: backoff_time_ms=4, playback_cookie=7.
+                        Long backoff = YTProto.getInt(part.data, 4);
+                        if (backoff != null && backoff > 0) {
+                            backoffUntilMs = Math.max(backoffUntilMs,
+                                    System.currentTimeMillis() + Math.min(backoff, 30000L));
+                        }
                         byte[] cookie = YTProto.getBytes(part.data, 7);
                         if (cookie != null && cookie.length > 0) playbackCookie = cookie;
                     } else if (part.id == YTSabr.SABR_REDIRECT) {
@@ -1443,7 +1470,7 @@ class YTSabrSession {
                 initializedIds = new ArrayList<>(initialized.values());
                 ranges = bufferedRanges();
                 payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
-                        playbackCookie, initializedIds, ranges, activeContexts());
+                        playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
                 continue;
             }
             return;
