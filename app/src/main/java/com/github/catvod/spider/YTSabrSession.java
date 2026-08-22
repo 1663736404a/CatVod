@@ -183,7 +183,9 @@ class YTSabrSession {
         }
         long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
         while (!canceled && System.currentTimeMillis() < deadline) {
-            lock.lock();
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) break;
+            if (!lock.tryLock(Math.min(100L, remaining), TimeUnit.MILLISECONDS)) continue;
             try {
                 Integer itag = "video".equals(track)
                         ? (videoItem == null ? null : videoItem.itag)
