@@ -180,10 +180,16 @@ final class YTPlay {
         // (observed at +15s and +18s), and by then the host may have cleared its jar-loader, which
         // answers those refetches with HTTP 500 null_or_empty and kills playback. Redirecting once
         // gets the player a durable URL for every later manifest refresh.
-        if (("sabr_mpd".equals(type) || "sabr_mpd2".equals(type)) && !"1".equals(params.get("ytr"))) {
-            String query = manifestQuery(params, type);
-            String owned = query == null ? null : YTServer.url(ownerId, siteKey, query);
-            if (owned != null) return redirect(owned);
+        if ("sabr_mpd".equals(type) || "sabr_mpd2".equals(type)) {
+            // A manifest request is the first sign the player moved to another video. Stop the
+            // previous one's producer here rather than waiting for a size-based reap that a busy
+            // (and therefore non-idle) session never triggers.
+            cancelOtherVideos(params.get("vid"));
+            if (!"1".equals(params.get("ytr"))) {
+                String query = manifestQuery(params, type);
+                String owned = query == null ? null : YTServer.url(ownerId, siteKey, query);
+                if (owned != null) return redirect(owned);
+            }
         }
         switch (type) {
             case "mpd":
@@ -858,6 +864,34 @@ final class YTPlay {
     }
 
     /**
+     * Cancels sessions belonging to any video other than {@code keepVid}.
+     *
+     * <p>Switching episodes used to leave the previous video's producer running: the reaper only
+     * fires when the map exceeds a size threshold, and the old session is not idle while it is busy
+     * retrying, so it kept issuing SABR requests for a video nobody is watching (observed: the old
+     * itag-328 producer still pumping rn=9 after the next video had started). State keys are
+     * {@code vid:...}, so the video is identifiable from the key alone.
+     */
+    private void cancelOtherVideos(String keepVid) {
+        if (TextUtils.isEmpty(keepVid)) return;
+        String prefix = keepVid + ":";
+        synchronized (YouTubeLite.sabrState) {
+            for (String key : new ArrayList<>(YouTubeLite.sabrState.keySet())) {
+                if (key.startsWith(prefix)) continue;
+                // Only touch sessions this instance owns; another live Spider may be serving
+                // a different video legitimately (background preload, cast).
+                if (!ownerId.equals(YouTubeLite.sabrOwners.get(key))) continue;
+                YTSabrSession value = YouTubeLite.sabrState.remove(key);
+                YouTubeLite.sabrOwners.remove(key);
+                ownedStateKeys.remove(key);
+                if (value == null) continue;
+                value.cancel();
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 切换视频停止旧会话: key=" + key);
+            }
+        }
+    }
+
+    /**
      * Video cache ceiling, derived from the real Java heap rather than a fixed number.
      *
      * <p>The previous 576 MiB default exceeded the whole heap on common devices (observed limit:
@@ -1006,6 +1040,7 @@ final class YTPlay {
         long durationMs = Math.max(1000L, data.duration * 1000L);
         String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
         YTSabrSession bSession = session(stateKey);
+        bSession.touch();
         bSession.startProducer(data.videoItem, data.audioItem, durationMs);
         // The producer owns SABR I/O. Snapshot only what is already indexed; later media requests
         // continue using the producer's real MEDIA_HEADER time/native-sequence index.
@@ -1202,7 +1237,13 @@ final class YTPlay {
             }
         }
         try {
-            YTSabrSession.Found found = session(stateKey)
+            YTSabrSession active = session(stateKey);
+            // A segment request can arrive against a session that was just replaced (the previous
+            // one cancelled on a video switch, or reaped). A fresh session has no producer until the
+            // next manifest fetch, so start it here instead of waiting 12s for a timeout.
+            active.startProducer(data.videoItem, data.audioItem,
+                    Math.max(1000L, data.duration * 1000L));
+            YTSabrSession.Found found = active
                     .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, 12000L);
             if (found == null || found.media == null || found.media.length == 0) {
                 return text(503, "SABR-B 未产生目标时间媒体");
