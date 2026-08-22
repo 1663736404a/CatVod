@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * YouTube catalog source with JAR-owned SABR playback.
@@ -46,6 +47,7 @@ public class YouTube extends Spider {
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
     private final Map<String, YTParse.Playlist> playlistCache = new HashMap<>();
+    private final AtomicLong playbackGeneration = new AtomicLong();
 
     /** Paged search state: pages are appended as continuations are followed. */
     private static class SearchSession {
@@ -169,15 +171,16 @@ public class YouTube extends Spider {
         int at = rawPid.lastIndexOf('@');
         if (at > 0) videoId = rawPid.substring(0, at);
         String quality = YouTubeLite.optString(ext, "quality", "best");
+        String sid = String.valueOf(playbackGeneration.incrementAndGet());
         // YouTube playback is SABR-only here. Keep A (the experimental SegmentTemplate bridge)
         // and B (the SegmentBase bridge) as explicit choices; do not mix direct URLs into this menu.
         List<String> urls = new ArrayList<>();
         urls.add("sabr•A");
         urls.add(Proxy.getUrl(siteKey, "&type=sabr_mpd&vid=" + Uri.encode(videoId)
-                + "&quality=" + Uri.encode(quality)));
+                + "&quality=" + Uri.encode(quality) + "&sid=" + sid));
         urls.add("sabr•B");
         urls.add(Proxy.getUrl(siteKey, "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
-                + "&quality=" + Uri.encode(quality)));
+                + "&quality=" + Uri.encode(quality) + "&sid=" + sid));
         return Result.get().url(urls).dash().string();
     }
 
