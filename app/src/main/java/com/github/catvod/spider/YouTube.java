@@ -186,7 +186,18 @@ public class YouTube extends Spider {
 
     @Override
     public Object[] proxy(Map<String, String> params) {
-        return youtubeProxy.handle(params);
+        return youtubeProxy == null ? new Object[]{499, "text/plain; charset=utf-8", "YouTube 播放会话已关闭"}
+                : youtubeProxy.handle(params);
+    }
+
+    @Override
+    public void destroy() {
+        if (play != null) play.destroy();
+        if (http != null) http.close();
+        youtubeProxy = null;
+        play = null;
+        yt = null;
+        http = null;
     }
 
     @Override
