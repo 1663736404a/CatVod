@@ -47,6 +47,7 @@ public class YouTube extends Spider {
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
     private final Map<String, YTParse.Playlist> playlistCache = new HashMap<>();
+    private final Map<String, String> titleCache = new HashMap<>();
     private final AtomicLong playbackGeneration = new AtomicLong();
 
     /** Paged search state: pages are appended as continuations are followed. */
@@ -141,7 +142,18 @@ public class YouTube extends Spider {
         String videoId = rawId.startsWith("v:") ? rawId.substring(2) : rawId;
         // Detail is metadata-only. Avoid player/BotGuard/related-video work here so a
         // slow YouTube response cannot consume the host detail timeout.
-        String title = videoTitle(videoId);
+        String title;
+        synchronized (titleCache) {
+            title = titleCache.get(videoId);
+        }
+        if (TextUtils.isEmpty(title)) {
+            // History/detail must remain metadata-only. An oEmbed request here can block the
+            // host's detail timeout and make opening a history item look like playback failed.
+            title = videoId;
+            synchronized (titleCache) {
+                titleCache.put(videoId, title);
+            }
+        }
         String safeTitle = YTParse.safeTitle(title);
         List<String> playFrom = new ArrayList<>();
         List<String> playUrl = new ArrayList<>();
@@ -186,8 +198,7 @@ public class YouTube extends Spider {
 
     @Override
     public Object[] proxy(Map<String, String> params) {
-        return youtubeProxy == null ? new Object[]{499, "text/plain; charset=utf-8", "YouTube 播放会话已关闭"}
-                : youtubeProxy.handle(params);
+        return youtubeProxy == null ? null : youtubeProxy.handle(params);
     }
 
     @Override
@@ -245,7 +256,7 @@ public class YouTube extends Spider {
     private String videoTitle(String vid) {
         try {
             String json = http.string("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v="
-                    + Uri.encode(vid) + "&format=json", null, 5000);
+                    + Uri.encode(vid) + "&format=json", null, 1800);
             JsonObject obj = Json.safeObject(json);
             return YouTubeLite.optString(obj, "title", vid);
         } catch (Throwable e) {
