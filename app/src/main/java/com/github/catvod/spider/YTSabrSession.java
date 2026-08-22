@@ -210,7 +210,11 @@ class YTSabrSession {
             targetMs = Math.max(0, (wantSeq - 1) * dashSegMs);
         }
 
-        int maxPumps = wantInit ? Math.min(3, fetchRequests) : fetchRequests;
+        // A B time request may start behind the server's current playback window. Give it more
+        // pump opportunities than the normal numbered bridge, otherwise a missing boundary turns
+        // into HTTP 503 and DASH restarts from zero (the observed tiny-picture loop).
+        int maxPumps = wantInit ? Math.min(3, fetchRequests)
+                : wantTime != null ? Math.max(fetchRequests, 14) : fetchRequests;
 
         lock.lock();
         try {
@@ -307,6 +311,15 @@ class YTSabrSession {
                     result.requestCount = requestCount;
                     return result;
                 }
+                if (wantTime != null) {
+                    Found nearby = nearestSegmentAtTime(targetItag, targetMs, 12000L);
+                    if (nearby != null && nearby.media != null) {
+                        nearby.relaxed = true;
+                        nearby.targetMs = targetMs;
+                        nearby.requestCount = requestCount;
+                        return nearby;
+                    }
+                }
             }
             result.error = "segment not produced by SABR server";
             result.targetMs = targetMs == null ? 0 : targetMs;
@@ -394,7 +407,7 @@ class YTSabrSession {
                 return found;
             }
             // Never return an already-finished segment; only allow a slightly-ahead fallback.
-            if (start > targetMs && (start - targetMs) <= 1500 && start < forwardStart) {
+            if (start > targetMs && (start - targetMs) <= 6000 && start < forwardStart) {
                 forwardSeq = seq;
                 forwardStart = start;
                 forwardMeta = meta;
@@ -408,6 +421,38 @@ class YTSabrSession {
             return found;
         }
         return null;
+    }
+
+    /**
+     * Last-resort time lookup for B. A temporary SABR hole must not become HTTP 503, because DASH
+     * interprets that as a fatal source error and restarts the period from zero. Only return a
+     * nearby complete native segment; exact coverage remains the preferred path above.
+     */
+    private Found nearestSegmentAtTime(Integer targetItag, long targetMs, long toleranceMs) {
+        Map<Integer, byte[]> media = segments.get(targetItag);
+        Map<Integer, Meta> metas = segmentMeta.get(targetItag);
+        if (media == null || metas == null || media.isEmpty() || metas.isEmpty()) return null;
+        Integer bestSeq = null;
+        Meta bestMeta = null;
+        long bestDistance = Long.MAX_VALUE;
+        for (Map.Entry<Integer, Meta> entry : metas.entrySet()) {
+            if (!media.containsKey(entry.getKey())) continue;
+            Meta meta = entry.getValue();
+            long start = meta.startMs;
+            long end = start + Math.max(1L, meta.durationMs);
+            long distance = targetMs < start ? start - targetMs : targetMs >= end ? targetMs - end : 0;
+            if (distance <= toleranceMs && distance < bestDistance) {
+                bestSeq = entry.getKey();
+                bestMeta = meta;
+                bestDistance = distance;
+            }
+        }
+        if (bestSeq == null) return null;
+        Found found = new Found();
+        found.media = media.get(bestSeq);
+        found.nativeSeq = bestSeq;
+        found.meta = bestMeta;
+        return found;
     }
 
     private boolean hasPriorLocalMapping(Integer targetItag, Integer localNumber) {
