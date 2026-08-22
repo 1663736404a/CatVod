@@ -101,8 +101,22 @@ class YouTubeLite {
     private final Map<String, List<String[]>> sigPlanCache = new HashMap<>();
     private final long extractCacheTtl;
 
-    /** SABR session state, keyed by {@code vid:client:videoItag:audioItag}. */
-    final Map<String, YTSabrSession> sabrState = new HashMap<>();
+    /**
+     * SABR session state, keyed by {@code vid:sabr:generation:client:videoItag:audioItag}.
+     *
+     * <p>Static on purpose. The host clears its jar-loader registry whenever
+     * {@code HomeActivity.onDestroy()} runs — which Android triggers by reclaiming the backgrounded
+     * home screen while playback is in the foreground. That path calls
+     * {@code VodConfig.clear() -> BaseLoader.clear()}, which destroys every Spider and empties the
+     * registry, so the next request builds a brand new Spider (and a new YouTubeLite). If the SABR
+     * sessions lived on that instance, the rebuilt Spider would start from zero: no playback cookie,
+     * no UMP state, no cached segments, while the player still holds a manifest pointing at the old
+     * session. Keeping them here lets the rebuilt Spider adopt the running session instead.
+     */
+    static final Map<String, YTSabrSession> sabrState = new HashMap<>();
+
+    /** Which YTPlay instance created each session, so teardown never kills someone else's. */
+    static final Map<String, String> sabrOwners = new HashMap<>();
 
     YouTubeLite(android.content.Context context, YTHttp http, Map<String, String> headers, JsonObject config) {
         this.http = http;

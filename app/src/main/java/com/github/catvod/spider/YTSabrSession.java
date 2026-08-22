@@ -116,15 +116,60 @@ class YTSabrSession {
         return lastStatus;
     }
 
+    /**
+     * True when no consumer has requested a segment for well past the producer's idle window, so the
+     * session is safe to reap. Used to bound the static session map without touching live playback.
+     */
+    boolean isCanceled() {
+        return canceled;
+    }
+
+    boolean isIdle() {
+        if (canceled) return true;
+        long last = lastConsumerAt;
+        if (last <= 0) return false;
+        return System.currentTimeMillis() - last > CONSUMER_IDLE_MS * 3;
+    }
+
+    /**
+     * Stops this session without waiting for its lock.
+     *
+     * <p>Deliberately does not close the shared {@link YTHttp}: sessions now outlive the Spider that
+     * created them (so playback survives the host clearing its registry), and several may share one
+     * client. {@code YTHttp.close()} sets a permanent closed flag and cancels every in-flight call,
+     * so closing here would break sibling sessions that are still playing. The {@code canceled} flag
+     * plus the pump's own checks are enough to stop this session promptly; the in-flight response is
+     * abandoned when the parser observes the flag.
+     */
     void cancel() {
-        // Never wait for the SABR lock during Spider.destroy(): the lock may be held while an
-        // in-flight UMP response is being parsed. Closing OkHttp cancels that call and the
-        // canceled flag makes the parser/pump stop without blocking app shutdown.
         canceled = true;
-        try {
-            http.close();
-        } catch (Throwable ignored) {
+        synchronized (producerMonitor) {
+            producerVideoItem = null;
+            producerAudioItem = null;
+            producerMonitor.notifyAll();
         }
+        // Release the media cache immediately rather than waiting for the map entry to be reaped.
+        // At 2160p this is tens of MiB per session, and holding it is what pushes the process into
+        // the heap range where Android reclaims the host's home screen.
+        if (lock.tryLock()) {
+            try {
+                dropCaches();
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    /** Frees all cached media. Callers must hold {@link #lock}, or be certain nobody else can. */
+    private void dropCaches() {
+        segments.clear();
+        segmentMeta.clear();
+        segmentOrder.clear();
+        localSegmentMap.clear();
+        initSegments.clear();
+        partial.clear();
+        buffered.clear();
+        initialized.clear();
     }
 
     long requestCount() {
@@ -147,6 +192,19 @@ class YTSabrSession {
             producerThread.setDaemon(true);
             producerThread.start();
         }
+    }
+
+    /**
+     * How far ahead of the player the producer may prefetch, bounded so the resident cache stays
+     * within roughly half the video cache budget at the track's real bitrate.
+     */
+    private long prefetchLeadMs(YTFormat videoItem) {
+        long bitrate = videoItem == null ? 0L : videoItem.bitrate;
+        if (bitrate <= 0L) return 30000L;
+        long bytesPerSec = bitrate / 8L;
+        if (bytesPerSec <= 0L) return 30000L;
+        long affordableMs = (videoCacheBytes / 2L) / bytesPerSec * 1000L;
+        return Math.max(10000L, Math.min(30000L, affordableMs));
     }
 
     /** Restarts the producer if it self-terminated on idle while playback is still going. */
@@ -239,8 +297,14 @@ class YTSabrSession {
                 videoItem = producerVideoItem;
                 audioItem = producerAudioItem;
                 long target = producerTargetMs;
+                // Scale the prefetch horizon to the cache budget instead of always running 30s
+                // ahead. At 2160p/28Mbps a 30s lead is ~105MB resident, which together with the
+                // player's own buffers drove the heap to ~400MB of 512MB — the state in which
+                // Android reclaims the backgrounded HomeActivity and the host clears the Spider
+                // registry mid-playback. Small formats keep the full 30s lead.
+                long lead = prefetchLeadMs(videoItem);
                 goal = producerDurationMs > 0
-                        ? Math.min(producerDurationMs, target + 30000L) : target + 30000L;
+                        ? Math.min(producerDurationMs, target + lead) : target + lead;
             }
             if (videoItem == null || audioItem == null) return;
             // Self-terminate when nobody is consuming. cancel() alone is not enough: it depends on
@@ -251,6 +315,27 @@ class YTSabrSession {
             long idleMs = System.currentTimeMillis() - lastConsumerAt;
             if (lastConsumerAt > 0 && idleMs > CONSUMER_IDLE_MS) {
                 SpiderDebug.log("YouTube SABR-B producer 空闲退出: idleMs=" + idleMs);
+                // Keep the negotiated protocol state (cookie, rn, url) so a resumed player can be
+                // adopted cheaply, but let go of the media bytes: an idle 2160p cache is the single
+                // largest avoidable contributor to the heap pressure that gets the host reclaimed.
+                if (lock.tryLock()) {
+                    try {
+                        long freed = 0;
+                        for (Map<Integer, byte[]> track : segments.values()) {
+                            for (byte[] value : track.values()) freed += value.length;
+                        }
+                        segments.clear();
+                        segmentMeta.clear();
+                        segmentOrder.clear();
+                        localSegmentMap.clear();
+                        buffered.clear();
+                        partial.clear();
+                        SpiderDebug.log("YouTube SABR-B 空闲释放缓存: freed="
+                                + (freed / 1048576) + "MiB");
+                    } finally {
+                        lock.unlock();
+                    }
+                }
                 return;
             }
             try {
@@ -1042,6 +1127,9 @@ class YTSabrSession {
                 YTProto.UmpPart part;
                 int seenParts = 0;
                 while ((part = reader.next()) != null) {
+                    // cancel() no longer closes the shared HTTP client (siblings depend on it), so
+                    // abandon a long streaming response here instead of parsing it to completion.
+                    if (canceled) throw new IOException("Canceled: SABR session closed");
                     seenParts++;
                     if (part.id != YTSabr.MEDIA && part.id != YTSabr.MEDIA_HEADER && part.id != YTSabr.MEDIA_END) {
                         SpiderDebug.log("YouTube UMP 控制 part=" + part.id + ", bytes=" + part.data.length);
@@ -1218,12 +1306,26 @@ class YTSabrSession {
 
         long total = 0;
         for (byte[] value : media.values()) total += value.length;
-        // Retain enough native segments for retries and small timeline corrections.
-        while (total > maxBytes && order.size() > 8) {
+        // Retain enough native segments for retries and small timeline corrections, but scale the
+        // floor to segment size instead of pinning a fixed count. A flat "keep 8" floor is harmless
+        // for itag 248 (<1MB each) yet reserves ~157MB at 2160p, where one segment is ~19.6MB — the
+        // byte cap could never actually bite. That inflated the process heap to ~400MB of a 512MB
+        // limit, which is precisely the condition under which Android reclaims the backgrounded
+        // HomeActivity and the host wipes its Spider registry mid-playback.
+        int floor = 4;
+        if (!order.isEmpty()) {
+            long average = Math.max(1L, total / order.size());
+            // Never reserve more than a third of the budget as an untouchable floor.
+            long affordable = Math.max(1L, maxBytes / 3 / average);
+            floor = (int) Math.max(2L, Math.min(8L, affordable));
+        }
+        while (total > maxBytes && order.size() > floor) {
             Integer oldSeq = order.remove(0);
             byte[] oldMedia = media.remove(oldSeq);
             metas.remove(oldSeq);
             if (oldMedia != null) total -= oldMedia.length;
+            Map<Integer, Integer> mapping = localSegmentMap.get(itag);
+            if (mapping != null) mapping.values().removeIf(value -> value.equals(oldSeq));
         }
     }
 
