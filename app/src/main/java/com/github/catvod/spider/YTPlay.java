@@ -1284,8 +1284,8 @@ final class YTPlay {
                 // using getSegment()'s SABR request/UMP loop. This mirrors googlevideo's
                 // request-driven stream and PipePipe's requestOnce(): the requested t= value is
                 // immediately encoded as player_time_ms, so resume and seek do not queue behind t=0.
-                SpiderDebug.log("YouTube SABR-B 直接请求目标: track=" + track + ", segment=" + requested
-                        + ", hasMedia=" + active.hasMedia());
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 直接请求目标: track=" + track
+                        + ", segment=" + requested + ", hasMedia=" + active.hasMedia());
                 YTSabrSession.Found found = active
                         .getSegment(data.videoItem, data.audioItem, track, requested);
                 if (found == null || found.media == null || found.media.length == 0) {
