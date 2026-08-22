@@ -65,7 +65,8 @@ class YTSabrSession {
         long requestCount;
     }
 
-    final ReentrantLock lock = new ReentrantLock();
+    final ReentrantLock lock = new ReentrantLock(true);
+    private volatile boolean canceled;
 
     private byte[] playbackCookie;
     private String url;
@@ -105,6 +106,17 @@ class YTSabrSession {
         return lastStatus;
     }
 
+    void cancel() {
+        // Never wait for the SABR lock during Spider.destroy(): the lock may be held while an
+        // in-flight UMP response is being parsed. Closing OkHttp cancels that call and the
+        // canceled flag makes the parser/pump stop without blocking app shutdown.
+        canceled = true;
+        try {
+            http.close();
+        } catch (Throwable ignored) {
+        }
+    }
+
     long requestCount() {
         return requestCount;
     }
@@ -121,6 +133,7 @@ class YTSabrSession {
      *                number-to-native-sequence mapping error.
      */
     Found getSegment(YTFormat videoItem, YTFormat audioItem, String track, String segment) throws Exception {
+        if (canceled) throw new IOException("Canceled: SABR session closed");
         YTSabr.Config cfg = videoItem != null && videoItem.sabrConfig != null
                 ? videoItem.sabrConfig
                 : audioItem != null ? audioItem.sabrConfig : null;
@@ -216,6 +229,7 @@ class YTSabrSession {
             int seekAttempts = 0;
             int transportRetries = 0;
             for (int pump = 0; pump < maxPumps; pump++) {
+                if (canceled) throw new IOException("Canceled: SABR session closed");
                 Found found = wantInit ? initLookup(targetItag)
                         : wantTime != null && wantSeq != null ? findSegmentByTime(targetItag, targetMs, dashSegMs, wantSeq)
                         : wantTime != null ? findSegmentAtTime(targetItag, targetMs)
@@ -251,6 +265,16 @@ class YTSabrSession {
                     if (!YTHttp.isRetryable(e) || transportRetries >= 2) throw e;
                     transportRetries++;
                     partial.clear();
+                }
+                // Do not let a 4K video request monopolize the fair session lock across all
+                // pumps. Audio gets a turn between pump requests, preventing video-only stalls.
+                if (pump + 1 < maxPumps && !canceled) {
+                    lock.unlock();
+                    try {
+                        Thread.yield();
+                    } finally {
+                        lock.lock();
+                    }
                 }
             }
 
@@ -765,6 +789,7 @@ class YTSabrSession {
 
     /** Issues one SABR request and commits every segment it completes. */
     private void pumpOnce(YTSabr.Config cfg, YTFormat videoItem, YTFormat audioItem) throws Exception {
+        if (canceled) throw new IOException("Canceled: SABR session closed");
         Integer videoItag = videoItem == null || videoItem.itag == 0 ? null : videoItem.itag;
         Integer audioItag = audioItem == null || audioItem.itag == 0 ? null : audioItem.itag;
         List<byte[]> initializedIds = new ArrayList<>(initialized.values());
@@ -952,8 +977,8 @@ class YTSabrSession {
      * Segments clearly outside the playback window are dropped first, then the byte cap applies.
      */
     private void trimCache(int itag, long maxBytes) {
-        long keepAheadMs = 90000;
-        long keepBehindMs = 30000;
+        long keepAheadMs = 120000;
+        long keepBehindMs = 45000;
         Map<Integer, byte[]> media = segments.get(itag);
         Map<Integer, Meta> metas = segmentMeta.get(itag);
         List<Integer> order = segmentOrder.get(itag);
