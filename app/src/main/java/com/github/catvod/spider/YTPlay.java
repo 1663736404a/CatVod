@@ -44,6 +44,9 @@ final class YTPlay {
 
     private final Map<String, PlayData> playCache = new HashMap<>();
     private final Map<String, SabrData> sabrCache = new HashMap<>();
+    // A and B can request the same video MPD concurrently. Serialize extraction per video so
+    // both routes share one successful TVHTML5/poToken response instead of racing BotGuard.
+    private final Map<String, Object> sabrExtractLocks = new HashMap<>();
     private final Map<String, Long> refreshMarks = new HashMap<>();
     // A local MPD can outlive the host's current episode during sequential playback.
     // Include a generation in the SABR state key so a new extraction never reuses old UMP state.
@@ -124,6 +127,12 @@ final class YTPlay {
     /** Absolute local-proxy URL, usable inside a manifest. */
     String localUrl(String params) {
         return Proxy.getUrl() + "?do=csp&siteKey=" + siteKey + params;
+    }
+
+    private static String sabrCacheKey(String vid, String quality, String sid, boolean b) {
+        String key = (b ? "yt_sabr_b_" : "yt_sabr_") + vid;
+        if (!"best".equals(quality)) key += "_" + quality;
+        return TextUtils.isEmpty(sid) ? key : key + ":sid=" + sid;
     }
 
     /* ------------------------------------------------------------------ */
@@ -717,12 +726,25 @@ final class YTPlay {
             data = null;
         }
         if (data == null && rebuild) {
-            try {
-                YouTubeLite.Extracted extracted = yt.extract(vid, true);
-                data = newSabrData(vid, extracted, quality, cacheKey);
-            } catch (Throwable e) {
-                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR extraction failed: vid="
-                        + vid + ", error=" + String.valueOf(e));
+            Object lock;
+            synchronized (sabrExtractLocks) {
+                lock = sabrExtractLocks.get(cacheKey);
+                if (lock == null) {
+                    lock = new Object();
+                    sabrExtractLocks.put(cacheKey, lock);
+                }
+            }
+            synchronized (lock) {
+                data = sabrCache.get(cacheKey);
+                if (data == null) {
+                    try {
+                        YouTubeLite.Extracted extracted = yt.extract(vid, true);
+                        data = newSabrData(vid, extracted, quality, cacheKey);
+                    } catch (Throwable e) {
+                        com.github.catvod.crawler.SpiderDebug.log("YouTube SABR extraction failed: vid="
+                                + vid + ", error=" + String.valueOf(e));
+                    }
+                }
             }
         }
         return data;
@@ -743,13 +765,15 @@ final class YTPlay {
     private Object[] proxySabrMpd(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String cacheKey = "best".equals(quality) ? "yt_sabr_" + vid : "yt_sabr_" + vid + "_" + quality;
+        String sid = params.get("sid");
+        String cacheKey = sabrCacheKey(vid, quality, sid, false);
         SabrData data = vid == null ? null : sabrData(vid, quality, cacheKey, true);
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
         YTFormat video = data.videoItem;
         YTFormat audio = data.audioItem;
         long duration = data.duration;
-        String base = localUrl("&type=sabr&vid=" + enc(vid) + "&quality=" + enc(quality));
+        String base = localUrl("&type=sabr&vid=" + enc(vid) + "&quality=" + enc(quality)
+                + (TextUtils.isEmpty(sid) ? "" : "&sid=" + enc(sid)));
         long videoSegMs = (long) ((video.sabrConfig == null ? 6 : video.sabrConfig.targetDurationSec) * 1000);
         if (videoSegMs <= 0) videoSegMs = 6000;
         long audioSegMs = (long) ((audio.sabrConfig == null ? 10 : audio.sabrConfig.targetDurationSec) * 1000);
@@ -808,7 +832,8 @@ final class YTPlay {
     private Object[] proxySabrMpd2(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String cacheKey = "best".equals(quality) ? "yt_sabr_b_" + vid : "yt_sabr_b_" + vid + "_" + quality;
+        String sid = params.get("sid");
+        String cacheKey = sabrCacheKey(vid, quality, sid, true);
         SabrData data = vid == null ? null : sabrData(vid, quality, cacheKey, true);
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
         long durationMs = Math.max(1000L, data.duration * 1000L);
@@ -827,18 +852,19 @@ final class YTPlay {
                 .append(data.duration).append("S\" minBufferTime=\"PT5S\" ")
                 .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
                 .append("  <Period id=\"1\" start=\"PT0S\">\n")
-                .append(timeTemplateSet(vid, quality, data.videoItem, "video", true, videoRows))
-                .append(timeTemplateSet(vid, quality, data.audioItem, "audio", false, audioRows))
+                .append(timeTemplateSet(vid, quality, sid, data.videoItem, "video", true, videoRows))
+                .append(timeTemplateSet(vid, quality, sid, data.audioItem, "audio", false, audioRows))
                 .append("  </Period>\n</MPD>");
         return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
     }
 
-    private String timeTemplateSet(String vid, String quality, YTFormat item, String track,
+    private String timeTemplateSet(String vid, String quality, String sid, YTFormat item, String track,
                                    boolean video, String rows) {
+        String sidParam = TextUtils.isEmpty(sid) ? "" : "&sid=" + enc(sid);
         String init = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
-                + "&track=" + track + "&seg=init");
+                + sidParam + "&track=" + track + "&seg=init");
         String media = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
-                + "&track=" + track + "&seg=t=$Time$&n=$Number$");
+                + sidParam + "&track=" + track + "&seg=t=$Time$&n=$Number$");
         StringBuilder sb = new StringBuilder();
         sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"")
                 .append(track).append("\" mimeType=\"")
@@ -973,7 +999,8 @@ final class YTPlay {
     private Object[] proxySabrTime(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String cacheKey = "best".equals(quality) ? "yt_sabr_b_" + vid : "yt_sabr_b_" + vid + "_" + quality;
+        String sid = params.get("sid");
+        String cacheKey = sabrCacheKey(vid, quality, sid, true);
         String track = params.get("track") == null ? "video" : params.get("track");
         String segment = params.get("seg") == null ? "init" : params.get("seg");
         if (!"video".equals(track) && !"audio".equals(track)) return text(400, "无效 SABR 轨道");
@@ -1057,7 +1084,8 @@ final class YTPlay {
     private Object[] proxySabr(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String cacheKey = "best".equals(quality) ? "yt_sabr_" + vid : "yt_sabr_" + vid + "_" + quality;
+        String sid = params.get("sid");
+        String cacheKey = sabrCacheKey(vid, quality, sid, false);
         String track = params.get("track") == null ? "video" : params.get("track");
         String segment = params.get("seg") == null ? "init" : params.get("seg");
         SabrData data = vid == null ? null : sabrCache.get(cacheKey);
