@@ -74,6 +74,9 @@ class YTSabrSession {
     private YTFormat producerAudioItem;
     private long producerTargetMs;
     private long producerDurationMs;
+    /** Stop prefetching this long after the last real segment request from the player. */
+    private static final long CONSUMER_IDLE_MS = 20000L;
+    private volatile long lastConsumerAt;
 
     private byte[] playbackCookie;
     private String url;
@@ -134,11 +137,24 @@ class YTSabrSession {
             producerVideoItem = videoItem;
             producerAudioItem = audioItem;
             producerDurationMs = Math.max(0L, durationMs);
+            lastConsumerAt = System.currentTimeMillis();
             if (producerThread != null && producerThread.isAlive()) {
                 producerMonitor.notifyAll();
                 return;
             }
             canceled = false;
+            producerThread = new Thread(() -> producerLoop(), "youtube-sabr-b-producer");
+            producerThread.setDaemon(true);
+            producerThread.start();
+        }
+    }
+
+    /** Restarts the producer if it self-terminated on idle while playback is still going. */
+    private void reviveProducer() {
+        synchronized (producerMonitor) {
+            if (canceled) return;
+            if (producerVideoItem == null || producerAudioItem == null) return;
+            if (producerThread != null && producerThread.isAlive()) return;
             producerThread = new Thread(() -> producerLoop(), "youtube-sabr-b-producer");
             producerThread.setDaemon(true);
             producerThread.start();
@@ -152,6 +168,8 @@ class YTSabrSession {
     Found awaitProducedSegment(YTFormat videoItem, YTFormat audioItem, String track,
                                String segment, long timeoutMs) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
+        lastConsumerAt = System.currentTimeMillis();
+        reviveProducer();
         boolean init = "init".equals(segment);
         long targetMs = 0L;
         if (!init) {
@@ -225,6 +243,16 @@ class YTSabrSession {
                         ? Math.min(producerDurationMs, target + 30000L) : target + 30000L;
             }
             if (videoItem == null || audioItem == null) return;
+            // Self-terminate when nobody is consuming. cancel() alone is not enough: it depends on
+            // the host calling destroy() and on the deferred teardown firing, so a stranded
+            // producer used to keep pulling 2160p segments long after the player was gone
+            // (observed: 31s past activity destroy, plus a second concurrent session on the same
+            // video). This bounds wasted traffic to the idle window regardless of teardown.
+            long idleMs = System.currentTimeMillis() - lastConsumerAt;
+            if (lastConsumerAt > 0 && idleMs > CONSUMER_IDLE_MS) {
+                SpiderDebug.log("YouTube SABR-B producer 空闲退出: idleMs=" + idleMs);
+                return;
+            }
             try {
                 if (!lock.tryLock(250L, TimeUnit.MILLISECONDS)) continue;
                 locked = true;
@@ -272,6 +300,7 @@ class YTSabrSession {
      */
     Found getSegment(YTFormat videoItem, YTFormat audioItem, String track, String segment) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
+        lastConsumerAt = System.currentTimeMillis();
         YTSabr.Config cfg = videoItem != null && videoItem.sabrConfig != null
                 ? videoItem.sabrConfig
                 : audioItem != null ? audioItem.sabrConfig : null;
