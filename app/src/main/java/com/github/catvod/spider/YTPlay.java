@@ -841,6 +841,8 @@ final class YTPlay {
      * the real MEDIA_HEADER boundaries, maps the local number to a native sequence, and serves
      * the cached complete native segment. This keeps B usable for SABR formats that have no
      * direct URL from which an sidx/Cues index could be read.
+     *
+     * Final startup/rebuffer stabilization pass: B retries target-time gaps instead of restarting.
      */
     private Object[] proxySabrMpd2(Map<String, String> params) {
         String vid = params.get("vid");
