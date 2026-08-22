@@ -142,6 +142,27 @@ class YouTubeLite {
         return extract(urlOrId, false);
     }
 
+    /**
+     * Drops every cached artefact for one video so the next extract really goes to the network.
+     *
+     * <p>Needed when the server answers SABR with {@code RELOAD_PLAYER_RESPONSE}: the streaming URL
+     * and ustreamer config belong to an expired player response, and a forced refresh that still
+     * consults these caches would hand back the same dead config.
+     */
+    void invalidateExtract(String urlOrId) {
+        String videoId;
+        try {
+            videoId = extractVideoId(urlOrId);
+        } catch (Throwable e) {
+            videoId = urlOrId;
+        }
+        if (videoId == null) return;
+        synchronized (extractCache) {
+            extractCache.remove(videoId);
+        }
+        extractCacheData.remove(videoId);
+    }
+
     Extracted extract(String urlOrId, boolean forceRefresh) throws Exception {
         String videoId = extractVideoId(urlOrId);
         Object lock;
