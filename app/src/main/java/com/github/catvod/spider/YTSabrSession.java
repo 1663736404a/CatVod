@@ -626,6 +626,12 @@ class YTSabrSession {
                 if (found != null && found.media != null) {
                     found.targetMs = targetMs == null ? 0 : targetMs;
                     found.requestCount = requestCount;
+                    if (wantTime != null && found.meta != null) {
+                        SpiderDebug.log("YouTube SABR-B 命中真实边界: track=" + track
+                                + ", targetMs=" + targetMs + ", nativeSeq=" + found.nativeSeq
+                                + ", startMs=" + found.meta.startMs + ", durationMs=" + found.meta.durationMs
+                                + ", size=" + found.media.length + ", relaxed=" + found.relaxed);
+                    }
                     return found;
                 }
                 boolean gapSeek = !wantInit && wantTime == null && !seeked
@@ -697,7 +703,14 @@ class YTSabrSession {
                     return result;
                 }
                 if (wantTime != null) {
-                    Found nearby = nearestSegmentAtTime(targetItag, targetMs, 12000L);
+                    // Never bridge a large time hole with an unrelated video Cluster. AAC can
+                    // tolerate a wider boundary, but a VP9 WebM Cluster returned 12s away can
+                    // make the picture stop while audio continues. Keep the audio fallback wide;
+                    // require video to be within one real segment-sized boundary.
+                    long nearbyTolerance = "video".equals(track)
+                            ? Math.max(1000L, Math.min(2500L, dashSegMs / 2L))
+                            : 12000L;
+                    Found nearby = nearestSegmentAtTime(targetItag, targetMs, nearbyTolerance);
                     if (nearby != null && nearby.media != null) {
                         nearby.relaxed = true;
                         nearby.targetMs = targetMs;
@@ -807,7 +820,11 @@ class YTSabrSession {
                 return found;
             }
             // Never return an already-finished segment; only allow a slightly-ahead fallback.
-            if (start > targetMs && (start - targetMs) <= 6000 && start < forwardStart) {
+            // For B target-time requests, do not substitute an arbitrary forward segment.
+            // Returning the next Cluster for a missing target can keep AAC advancing while VP9
+            // receives a non-contiguous WebM timestamp sequence. The caller will pump/seek again
+            // instead of publishing a wrong video segment.
+            if (start > targetMs && (start - targetMs) <= 1000 && start < forwardStart) {
                 forwardSeq = seq;
                 forwardStart = start;
                 forwardMeta = meta;
@@ -1337,7 +1354,17 @@ class YTSabrSession {
                         if (item == null || item.itag == null
                                 || !targetItags.contains(item.itag.intValue())) continue;
                         byte[] media = item.data.toByteArray();
-                        if (item.expected != null && item.expected != media.length) continue;
+                        if (item.expected != null && item.expected.longValue() != media.length) {
+                            SpiderDebug.log("YouTube UMP 分片长度不匹配: header=" + item.headerId
+                                    + ", itag=" + item.itag + ", seq=" + item.seq
+                                    + ", expected=" + item.expected + ", actual=" + media.length);
+                            continue;
+                        }
+                        if (media.length == 0 && !item.isInit) {
+                            SpiderDebug.log("YouTube UMP 空媒体分片: header=" + item.headerId
+                                    + ", itag=" + item.itag + ", seq=" + item.seq);
+                            continue;
+                        }
                         int itag = item.itag.intValue();
                         if (item.isInit) {
                             initSegments.put(itag, media);
