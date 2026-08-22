@@ -395,6 +395,8 @@ final class YTServer {
                 return "Not Found";
             case 405:
                 return "Method Not Allowed";
+            case 302:
+                return "Found";
             case 410:
                 return "Gone";
             case 500:

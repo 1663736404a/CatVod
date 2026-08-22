@@ -59,7 +59,8 @@ final class YTPlay {
     private final Object sabrSwitchLock = new Object();
     private volatile boolean destroyed;
     private volatile boolean destroyRequested;
-    private volatile long lastProxyAt;
+    /** Last time the player itself asked for media; drives deferred teardown. */
+    private volatile long lastPlayerAt;
     private volatile boolean destroyScheduled;
     private final Object destroyMonitor = new Object();
 
@@ -108,19 +109,19 @@ final class YTPlay {
 
     void destroy() {
         // The host may call destroy() for mobile-home-destroy while the player still owns the
-        // proxy URL. Defer hard teardown until the proxy has been idle for a grace period.
+        // media URL. Defer hard teardown until the *player* has been idle for a grace period.
         destroyRequested = true;
-        lastProxyAt = System.currentTimeMillis();
+        lastPlayerAt = System.currentTimeMillis();
         synchronized (destroyMonitor) {
             if (destroyed || destroyScheduled) return;
             destroyScheduled = true;
             Thread deferred = new Thread(() -> {
                 while (!destroyed) {
                     try {
-                        Thread.sleep(30000L);
+                        Thread.sleep(5000L);
                     } catch (InterruptedException ignored) {
                     }
-                    if (System.currentTimeMillis() - lastProxyAt >= 30000L) {
+                    if (System.currentTimeMillis() - lastPlayerAt >= 30000L) {
                         hardDestroy();
                         return;
                     }
@@ -150,10 +151,25 @@ final class YTPlay {
     }
 
     Object[] proxy(Map<String, String> params) {
-        lastProxyAt = System.currentTimeMillis();
+        // Only a real player request counts as liveness. The SABR producer also calls in through
+        // this JAR, so refreshing the deadline on every proxy() call let the session keep itself
+        // alive forever: observed downloading for 31s after the player was destroyed, and two
+        // concurrent sessions (old producer + new one) fetching the same 2160p video at once.
+        lastPlayerAt = System.currentTimeMillis();
         if (destroyed) return text(499, "YouTube 播放会话已关闭");
         String type = params.get("type");
         if (type == null) return null;
+        // Move the manifest onto the JAR-owned server via a redirect. The player's initial URL must
+        // stay proxy:// so the host does not classify playback as EXTERNAL_LOOPBACK_PROXY and stall
+        // 5s on a readiness probe it can never pass; but the manifest is re-fetched during playback
+        // (observed at +15s and +18s), and by then the host may have cleared its jar-loader, which
+        // answers those refetches with HTTP 500 null_or_empty and kills playback. Redirecting once
+        // gets the player a durable URL for every later manifest refresh.
+        if (("sabr_mpd".equals(type) || "sabr_mpd2".equals(type)) && !"1".equals(params.get("ytr"))) {
+            String query = manifestQuery(params, type);
+            String owned = query == null ? null : YTServer.url(ownerId, siteKey, query);
+            if (owned != null) return redirect(owned);
+        }
         switch (type) {
             case "mpd":
                 return proxyMpd(params);
@@ -1315,6 +1331,31 @@ final class YTPlay {
         if (text == null) return "";
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace("\"", "&" + "quot;").replace("'", "&#39;");
+    }
+
+    /**
+     * Rebuilds the manifest query for the JAR-owned server, tagging it so the redirect happens
+     * once. Only the parameters the manifest routes actually read are forwarded.
+     */
+    private static String manifestQuery(Map<String, String> params, String type) {
+        String vid = params.get("vid");
+        if (TextUtils.isEmpty(vid)) return null;
+        StringBuilder sb = new StringBuilder();
+        sb.append("&type=").append(type).append("&vid=").append(enc(vid));
+        String quality = params.get("quality");
+        sb.append("&quality=").append(enc(TextUtils.isEmpty(quality) ? "best" : quality));
+        String sid = params.get("sid");
+        if (!TextUtils.isEmpty(sid)) sb.append("&sid=").append(enc(sid));
+        sb.append("&ytr=1");
+        return sb.toString();
+    }
+
+    private static Object[] redirect(String location) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Location", location);
+        headers.put("Content-Length", "0");
+        headers.put("Cache-Control", "no-store");
+        return new Object[]{302, "text/plain; charset=utf-8", new ByteArrayInputStream(new byte[0]), headers};
     }
 
     private static Object[] text(int code, String message) {
