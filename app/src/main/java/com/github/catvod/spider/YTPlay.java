@@ -52,6 +52,7 @@ final class YTPlay {
     // Include a generation in the SABR state key so a new extraction never reuses old UMP state.
     private final Map<String, Long> sabrGenerations = new HashMap<>();
     private final Object sabrSwitchLock = new Object();
+    private volatile boolean destroyed;
 
     YTPlay(YouTubeLite yt, Map<String, String> header, JsonObject ext, String siteKey) {
         this.yt = yt;
@@ -95,7 +96,18 @@ final class YTPlay {
     /* proxy entry point                                                  */
     /* ------------------------------------------------------------------ */
 
+    void destroy() {
+        destroyed = true;
+        synchronized (yt.sabrState) {
+            for (YTSabrSession value : yt.sabrState.values()) value.cancel();
+            yt.sabrState.clear();
+        }
+        sabrCache.clear();
+        playCache.clear();
+    }
+
     Object[] proxy(Map<String, String> params) {
+        if (destroyed) return text(499, "YouTube 播放会话已关闭");
         String type = params.get("type");
         if (type == null) return null;
         switch (type) {
@@ -709,9 +721,9 @@ final class YTPlay {
             if (found != null) return found;
             YTSabrSession created = new YTSabrSession(yt.http(),
                     (int) YouTubeLite.optLong(ext, "sabr_max_parts", 4096),
-                    YouTubeLite.optLong(ext, "sabr_video_cache_bytes", 512L * 1024 * 1024),
-                    YouTubeLite.optLong(ext, "sabr_audio_cache_bytes", 32L * 1024 * 1024),
-                    (int) YouTubeLite.optLong(ext, "sabr_segment_fetch_requests", 10));
+                    YouTubeLite.optLong(ext, "sabr_video_cache_bytes", 576L * 1024 * 1024),
+                    YouTubeLite.optLong(ext, "sabr_audio_cache_bytes", 48L * 1024 * 1024),
+                    (int) YouTubeLite.optLong(ext, "sabr_segment_fetch_requests", 14));
             yt.sabrState.put(stateKey, created);
             return created;
         }
@@ -850,7 +862,7 @@ final class YTPlay {
         StringBuilder mpd = new StringBuilder();
         mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
                 .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
-                .append(data.duration).append("S\" minBufferTime=\"PT5S\" ")
+                .append(data.duration).append("S\" minBufferTime=\"PT30S\" ")
                 .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
                 .append("  <Period id=\"1\" start=\"PT0S\">\n")
                 .append(timeTemplateSet(vid, quality, sid, data.videoItem, "video", true, videoRows))
@@ -865,7 +877,7 @@ final class YTPlay {
         String init = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
                 + sidParam + "&track=" + track + "&seg=init");
         String media = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
-                + sidParam + "&track=" + track + "&seg=t=$Time$&n=$Number$");
+                + sidParam + "&track=" + track + "&seg=t=$Time$");
         StringBuilder sb = new StringBuilder();
         sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"")
                 .append(track).append("\" mimeType=\"")
@@ -1012,15 +1024,19 @@ final class YTPlay {
             return text(404, "SABR-B 缓存不存在");
         }
         YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
-        String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+        // B keeps independent audio/video SABR sessions. A 4K video pump can take seconds; sharing
+        // its lock with audio is exactly what produced the previous "画面卡、声音断" pattern.
+        String stateKey = (data.stateKey == null ? vid + ":sabr:b" : data.stateKey)
+                + ":" + track;
         String requested = "init".equals(segment) ? "init" : null;
         if (requested == null) {
             if (!segment.startsWith("t=")) return text(400, "无效 SABR-B 时间段");
             try {
                 long targetMs = Math.max(0L, Long.parseLong(segment.substring(2)));
-                String number = params.get("n");
+                // B is intentionally time-only. The DASH number belongs to the virtual request
+                // grid, not to the SABR native sequence; feeding it back forces a false one-to-one
+                // mapping and produces video-only 503s when real segment duration changes.
                 requested = "t=" + targetMs;
-                if (number != null && !number.isEmpty()) requested += "&n=" + number;
             } catch (Throwable e) {
                 return text(400, "无效 SABR-B 时间段");
             }
