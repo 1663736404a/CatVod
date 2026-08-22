@@ -25,10 +25,10 @@ import java.util.Set;
  * <ul>
  *   <li><b>direct</b> ({@code mpd}/{@code media}/{@code single}/{@code yt_progressive}) — plain
  *       googlevideo URLs with real {@code initRange}/{@code indexRange}, proxied byte for byte.</li>
- *   <li><b>SABR</b> ({@code sabr_mpd}/{@code sabr_mpd2}/{@code sabr}/{@code sabr_range}) — formats
+ *   <li><b>SABR</b> ({@code sabr_mpd}/{@code sabr_mpd2}/{@code sabr}/{@code sabr_time}) — formats
  *       with no per-format URL, negotiated through {@link YTSabrSession}. {@code sabr_mpd} uses
- *       {@code SegmentTemplate/$Number$}; {@code sabr_mpd2} uses {@code SegmentBase} byte ranges,
- *       which removes the number-to-native-sequence mapping error entirely.</li>
+ *       local segment numbers; {@code sabr_mpd2} uses target-time URLs backed by real SABR
+ *       MEDIA_HEADER/native-sequence mapping and the session cache.</li>
  * </ul>
  */
 final class YTPlay {
@@ -106,11 +106,12 @@ final class YTPlay {
                 return proxyProgressive(params);
             case "sabr_mpd":
                 return proxySabrMpd(params);
-            // SegmentBase bridge, mirroring youtubei.js's is_sabr manifest: a SABR VOD manifest
-            // uses SegmentBase + indexRange rather than SegmentTemplate/$Number$. The older
-            // sabr_mpd route stays available for comparison and fallback.
+            // SABR-B now uses a target-time SegmentTemplate backed by real MEDIA_HEADER mapping.
+            // Keep the old route name so existing quality-menu URLs remain compatible.
             case "sabr_mpd2":
                 return proxySabrMpd2(params);
+            case "sabr_time":
+                return proxySabrTime(params);
             case "sabr_range":
                 return proxySabrRange(params);
             case "sabr":
@@ -796,33 +797,125 @@ final class YTPlay {
     }
 
     /**
-     * SegmentBase form of the SABR manifest.
+     * SABR-B manifest backed by target-time requests, not sidx/Cues.
      *
-     * <p>The player requests byte ranges and this proxy converts them to timestamps via the real
-     * sidx/Cues index, so no {@code $Number$} mapping error can accumulate.
+     * <p>The timeline below is only a request grid. Every media URL carries both the requested
+     * presentation time and local segment number. {@link YTSabrSession} then pumps SABR, parses
+     * the real MEDIA_HEADER boundaries, maps the local number to a native sequence, and serves
+     * the cached complete native segment. This keeps B usable for SABR formats that have no
+     * direct URL from which an sidx/Cues index could be read.
      */
     private Object[] proxySabrMpd2(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String cacheKey = "best".equals(quality) ? "yt_sabr_" + vid : "yt_sabr_" + vid + "_" + quality;
+        String cacheKey = "best".equals(quality) ? "yt_sabr_b_" + vid : "yt_sabr_b_" + vid + "_" + quality;
         SabrData data = vid == null ? null : sabrData(vid, quality, cacheKey, true);
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
-        YTFormat video = data.videoItem;
-        YTFormat audio = data.audioItem;
-        long duration = data.duration;
-        List<YTFormat.Seg> videoTimeline = loadTimeline(video, duration * 1000);
-        List<YTFormat.Seg> audioTimeline = loadTimeline(audio, duration * 1000);
-        if (videoTimeline.isEmpty() || audioTimeline.isEmpty()) return text(500, "SABR SegmentBase 需要 sidx/Cues 时间轴");
+        long durationMs = Math.max(1000L, data.duration * 1000L);
+        String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+        List<YTFormat.Seg> videoReal = warmSabrTimeline(data, stateKey, "video");
+        List<YTFormat.Seg> audioReal = warmSabrTimeline(data, stateKey, "audio");
+        String videoRows = timeRows(videoReal, durationMs, sabrRequestGridMs(data.videoItem, true));
+        String audioRows = timeRows(audioReal, durationMs, sabrRequestGridMs(data.audioItem, false));
+        com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B MPD: vid=" + vid
+                + ", videoReal=" + videoReal.size() + ", audioReal=" + audioReal.size()
+                + ", videoGridMs=" + sabrRequestGridMs(data.videoItem, true)
+                + ", audioGridMs=" + sabrRequestGridMs(data.audioItem, false));
         StringBuilder mpd = new StringBuilder();
         mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
                 .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
-                .append(duration).append("S\" minBufferTime=\"PT5S\" ")
+                .append(data.duration).append("S\" minBufferTime=\"PT5S\" ")
                 .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
                 .append("  <Period id=\"1\" start=\"PT0S\">\n")
-                .append(baseSet(vid, video, "video", true))
-                .append(baseSet(vid, audio, "audio", false))
+                .append(timeTemplateSet(vid, quality, data.videoItem, "video", true, videoRows))
+                .append(timeTemplateSet(vid, quality, data.audioItem, "audio", false, audioRows))
                 .append("  </Period>\n</MPD>");
         return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
+    }
+
+    private String timeTemplateSet(String vid, String quality, YTFormat item, String track,
+                                   boolean video, String rows) {
+        String init = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
+                + "&track=" + track + "&seg=init");
+        String media = localUrl("&type=sabr_time&vid=" + enc(vid) + "&quality=" + enc(quality)
+                + "&track=" + track + "&seg=t=$Time$&n=$Number$");
+        StringBuilder sb = new StringBuilder();
+        sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"")
+                .append(track).append("\" mimeType=\"")
+                .append(esc(mimeBase(fallback(item.mimeType, video ? "video/webm" : "audio/webm"))))
+                .append("\" segmentAlignment=\"true\" startWithSAP=\"1\">\n")
+                .append("      <Representation id=\"sabr-b-").append(video ? "v" : "a").append(item.itag)
+                .append("\" bandwidth=\"").append(item.bitrate == 0 ? (video ? 1000000 : 128000) : item.bitrate)
+                .append("\" codecs=\"").append(esc(item.codecs)).append("\"");
+        if (video) sb.append(" width=\"").append(item.width).append("\" height=\"").append(item.height).append("\"");
+        sb.append(">\n")
+                .append("        <SegmentTemplate timescale=\"1000\" startNumber=\"1\" initialization=\"")
+                .append(esc(init)).append("\" media=\"").append(esc(media)).append("\">\n")
+                .append("          <SegmentTimeline>").append(rows)
+                .append("</SegmentTimeline>\n")
+                .append("        </SegmentTemplate>\n      </Representation>\n")
+                .append("    </AdaptationSet>\n");
+        return sb.toString();
+    }
+
+    private List<YTFormat.Seg> warmSabrTimeline(SabrData data, String stateKey, String track) {
+        List<YTFormat.Seg> empty = new ArrayList<>();
+        if (data == null || data.videoItem == null || data.audioItem == null) return empty;
+        try {
+            YTSabrSession sabr = session(stateKey);
+            // One init request establishes the UMP/SABR session and normally also returns the
+            // first MEDIA_HEADERs. A target-time request then pumps until the first real media
+            // interval is cached. Later MPD requests reuse this same session and cache.
+            sabr.getSegment(data.videoItem, data.audioItem, track, "init");
+            sabr.getSegment(data.videoItem, data.audioItem, track, "t=0&n=1");
+            int itag = "video".equals(track) ? data.videoItem.itag : data.audioItem.itag;
+            return sabr.snapshotTimeline(itag);
+        } catch (Throwable e) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 时间轴预热失败: track="
+                    + track + ", error=" + String.valueOf(e));
+            return empty;
+        }
+    }
+
+    private static String timeRows(List<YTFormat.Seg> real, long durationMs, long fallbackMs) {
+        StringBuilder rows = new StringBuilder();
+        long cursor = 0;
+        if (real != null) {
+            for (YTFormat.Seg seg : real) {
+                if (seg == null || seg.d <= 0 || seg.t < cursor || seg.t >= durationMs) continue;
+                rows.append("<S t=\"").append(seg.t).append("\" d=\"")
+                        .append(Math.min(seg.d, durationMs - seg.t)).append("\"/>");
+                cursor = Math.min(durationMs, seg.t + seg.d);
+            }
+        }
+        long step = Math.max(1000L, fallbackMs);
+        while (cursor < durationMs) {
+            long d = Math.min(step, durationMs - cursor);
+            rows.append("<S t=\"").append(cursor).append("\" d=\"")
+                    .append(Math.max(1L, d)).append("\"/>");
+            cursor += d;
+        }
+        return rows.toString();
+    }
+
+    private long sabrRequestGridMs(YTFormat item, boolean video) {
+        double target = item != null && item.sabrConfig != null ? item.sabrConfig.targetDurationSec : 0;
+        long ms = target > 0 ? (long) (target * 1000.0) : (video ? 6000L : 10000L);
+        if (video && ms < 3000L) ms = 6000L;
+        if (!video && ms < 8000L) ms = 10000L;
+        return Math.max(1000L, ms);
+    }
+
+    private static String virtualTimeRows(long durationMs, long segmentMs) {
+        StringBuilder rows = new StringBuilder();
+        long t = 0;
+        long step = Math.max(1000L, segmentMs);
+        while (t < durationMs) {
+            long d = Math.min(step, durationMs - t);
+            rows.append("<S t=\"").append(t).append("\" d=\"").append(Math.max(1L, d)).append("\"/>");
+            t += d;
+        }
+        return rows.toString();
     }
 
     private String baseSet(String vid, YTFormat item, String track, boolean video) {
@@ -874,61 +967,64 @@ final class YTPlay {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Answers a SegmentBase byte range.
-     *
-     * <p>init/index ranges come straight from the matching direct URL: SABR never sends a sidx and
-     * both ranges are tiny. Media ranges are mapped to a timestamp through the index and fetched
-     * from the SABR session, then sliced to the requested length.
+     * Serves B's target-time media requests. The DASH grid is only a hint; the SABR session
+     * returns the complete cached native segment whose real MEDIA_HEADER range covers targetMs.
      */
-    private Object[] proxySabrRange(Map<String, String> params) {
+    private Object[] proxySabrTime(Map<String, String> params) {
         String vid = params.get("vid");
+        String quality = params.get("quality") == null ? "best" : params.get("quality");
+        String cacheKey = "best".equals(quality) ? "yt_sabr_b_" + vid : "yt_sabr_b_" + vid + "_" + quality;
         String track = params.get("track") == null ? "video" : params.get("track");
+        String segment = params.get("seg") == null ? "init" : params.get("seg");
         if (!"video".equals(track) && !"audio".equals(track)) return text(400, "无效 SABR 轨道");
-        SabrData data = vid == null ? null : sabrCache.get("yt_sabr_" + vid);
-        if (data == null) return text(404, "SABR 缓存不存在");
-        YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
-        if (item == null) return text(404, track + " 流不存在");
-        long[] parsed = parseRange(range(params));
-        Long start = parsed == null || parsed[0] < 0 ? null : parsed[0];
-        Long end = parsed == null || parsed[1] < 0 ? null : parsed[1];
-        long[] indexRange = item.indexSource != null && item.indexSource.indexRange != null
-                ? item.indexSource.indexRange : item.indexRange;
-        long indexEnd = indexRange == null ? 0 : indexRange[1];
-        List<YTFormat.Seg> timeline = item.timeline == null ? new ArrayList<>() : item.timeline;
-        long totalBytes = YTIndex.totalBytes(timeline) + indexEnd + 1;
-        if (start != null && start <= indexEnd) return rangeFromDirect(item, start, end, indexEnd);
-        Long targetMs = YTIndex.timeForByte(timeline, start, indexEnd);
-        if (targetMs == null) return text(416, "无法将字节范围映射到时间轴");
-        String stateKey = data.stateKey == null ? vid + ":sabr" : data.stateKey;
-        YTSabrSession.Found found;
-        try {
-            found = session(stateKey).getSegment(data.videoItem, data.audioItem, track, "t=" + targetMs);
-        } catch (Throwable e) {
-            return text(500, "SABR 取段失败: " + e);
+
+        SabrData data = vid == null ? null : sabrCache.get(cacheKey);
+        if (data == null && vid != null) data = sabrData(vid, quality, cacheKey, true);
+        if (data == null || data.videoItem == null || data.audioItem == null) {
+            return text(404, "SABR-B 缓存不存在");
         }
-        if (found == null || found.media == null) return text(500, "SABR 分段不可用");
-        // The player asks for the byte range the sidx declared, while SABR returns whole native
-        // segments. Align by the requested length: return short content as-is, truncate overlong
-        // content. ExoPlayer trusts Content-Range for what it actually received.
-        byte[] media = found.media;
-        byte[] body = media;
-        if (start != null && end != null) {
-            int requested = (int) Math.max(0, end - start + 1);
-            if (requested < media.length) {
-                body = new byte[requested];
-                System.arraycopy(media, 0, body, 0, requested);
+        YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
+        String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+        String requested = "init".equals(segment) ? "init" : null;
+        if (requested == null) {
+            if (!segment.startsWith("t=")) return text(400, "无效 SABR-B 时间段");
+            try {
+                long targetMs = Math.max(0L, Long.parseLong(segment.substring(2)));
+                String number = params.get("n");
+                requested = "t=" + targetMs;
+                if (number != null && !number.isEmpty()) requested += "&n=" + number;
+            } catch (Throwable e) {
+                return text(400, "无效 SABR-B 时间段");
             }
         }
-        long begin = start == null ? 0 : start;
-        long realEnd = begin + body.length - 1;
-        String contentType = mimeBase(fallback(item.mimeType, "video".equals(track) ? "video/webm" : "audio/mp4"));
-        Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", contentType);
-        headers.put("Content-Length", String.valueOf(body.length));
-        headers.put("Content-Range", "bytes " + begin + "-" + realEnd + "/" + totalBytes);
-        headers.put("Accept-Ranges", "bytes");
-        headers.put("Cache-Control", "no-cache");
-        return bytes(206, contentType, body, headers);
+        try {
+            YTSabrSession.Found found = session(stateKey)
+                    .getSegment(data.videoItem, data.audioItem, track, requested);
+            if (found == null || found.media == null || found.media.length == 0) {
+                return text(503, "SABR-B 未产生目标时间媒体");
+            }
+            String contentType = mimeBase(fallback(item.mimeType,
+                    "video".equals(track) ? "video/webm" : "audio/webm"));
+            Map<String, String> headers = new LinkedHashMap<>();
+            headers.put("Content-Type", contentType);
+            headers.put("Content-Length", String.valueOf(found.media.length));
+            headers.put("Cache-Control", "private, max-age=30");
+            headers.put("Accept-Ranges", "none");
+            return bytes(200, contentType, found.media, headers);
+        } catch (Throwable e) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 取段失败: track=" + track
+                    + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
+                    + ", error=" + String.valueOf(e));
+            return text(503, "SABR-B 取段失败: " + String.valueOf(e));
+        }
+    }
+
+    /**
+     * Legacy SegmentBase byte-range endpoint retained for compatibility with old cached MPDs.
+     * New B manifests use {@link #proxySabrTime(Map)} and never depend on sidx/Cues.
+     */
+    private Object[] proxySabrRange(Map<String, String> params) {
+        return text(410, "旧 SABR-B 字节范围桥已停用");
     }
 
     private Object[] rangeFromDirect(YTFormat item, Long start, Long end, long indexEnd) {

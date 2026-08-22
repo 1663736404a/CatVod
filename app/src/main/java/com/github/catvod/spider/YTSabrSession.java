@@ -137,15 +137,26 @@ class YTSabrSession {
 
         boolean wantInit = "init".equals(segment);
         Long wantTime = null;
+        Integer wantSeq = null;
         if (!wantInit && segment != null && segment.startsWith("t=")) {
             try {
-                wantTime = Math.max(0, (long) Double.parseDouble(segment.substring(2)));
+                String raw = segment.substring(2);
+                int amp = raw.indexOf('&');
+                String timeText = amp < 0 ? raw : raw.substring(0, amp);
+                wantTime = Math.max(0, (long) Double.parseDouble(timeText));
+                // B supplies both the target presentation time and the local DASH number. The
+                // time selects the desired region; the number makes retries one-to-one with a
+                // native sequence when a virtual grid lands inside the same variable-length
+                // segment twice.
+                if (amp >= 0) {
+                    String extra = raw.substring(amp + 1);
+                    if (extra.startsWith("n=")) wantSeq = Integer.parseInt(extra.substring(2));
+                }
             } catch (Throwable e) {
                 result.error = "invalid time segment";
                 return result;
             }
         }
-        Integer wantSeq = null;
         if (!wantInit && wantTime == null) {
             try {
                 wantSeq = Integer.parseInt(segment);
@@ -206,6 +217,7 @@ class YTSabrSession {
             int transportRetries = 0;
             for (int pump = 0; pump < maxPumps; pump++) {
                 Found found = wantInit ? initLookup(targetItag)
+                        : wantTime != null && wantSeq != null ? findSegmentByTime(targetItag, targetMs, dashSegMs, wantSeq)
                         : wantTime != null ? findSegmentAtTime(targetItag, targetMs)
                         : findSegmentByTime(targetItag, targetMs, dashSegMs, wantSeq);
                 if (found != null && found.media != null) {
@@ -284,6 +296,35 @@ class YTSabrSession {
         Found found = new Found();
         found.media = media;
         return found;
+    }
+
+    /**
+     * Returns the real SABR media boundaries currently present in the session cache.
+     * The result is a copy, sorted by presentation time, so callers can safely use it while
+     * another request later extends the cache.
+     */
+    List<YTFormat.Seg> snapshotTimeline(Integer targetItag) {
+        lock.lock();
+        try {
+            Map<Integer, byte[]> media = segments.get(targetItag);
+            Map<Integer, Meta> metas = segmentMeta.get(targetItag);
+            List<YTFormat.Seg> out = new ArrayList<>();
+            if (media == null || metas == null) return out;
+            for (Map.Entry<Integer, Meta> entry : metas.entrySet()) {
+                if (!media.containsKey(entry.getKey())) continue;
+                Meta meta = entry.getValue();
+                if (meta == null || meta.durationMs <= 0) continue;
+                YTFormat.Seg seg = new YTFormat.Seg();
+                seg.t = Math.max(0, meta.startMs);
+                seg.d = Math.max(1, meta.durationMs);
+                seg.sz = Math.max(0, meta.size);
+                out.add(seg);
+            }
+            out.sort((a, b) -> Long.compare(a.t, b.t));
+            return out;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /* ------------------------------------------------------------------ */
