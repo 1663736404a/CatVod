@@ -88,6 +88,8 @@ class YTSabrSession {
     private volatile long lastTouchAt;
     /** True once the player has actually asked for a segment. */
     private volatile boolean consumerSeen;
+    /** True once any media has been cached; drives the warm/cold segment deadline. */
+    private volatile boolean mediaSeen;
 
     private byte[] playbackCookie;
     private String url;
@@ -129,6 +131,16 @@ class YTSabrSession {
 
     boolean isCanceled() {
         return canceled;
+    }
+
+    /**
+     * True once any media segment has been cached, i.e. the session is warm.
+     *
+     * <p>Backed by a volatile flag rather than inspecting the cache maps, which are guarded by
+     * {@link #lock} and would be unsafe to iterate from a caller that does not hold it.
+     */
+    boolean hasMedia() {
+        return mediaSeen;
     }
 
     /**
@@ -197,6 +209,7 @@ class YTSabrSession {
 
     /** Frees all cached media. Callers must hold {@link #lock}, or be certain nobody else can. */
     private void dropCaches() {
+        mediaSeen = false;
         segments.clear();
         segmentMeta.clear();
         segmentOrder.clear();
@@ -375,6 +388,9 @@ class YTSabrSession {
                         localSegmentMap.clear();
                         buffered.clear();
                         partial.clear();
+                        // init segments stay, so the session is still warm enough to skip the cold
+                        // deadline; only bulk media was released.
+                        mediaSeen = !initSegments.isEmpty();
                         SpiderDebug.log("YouTube SABR-B 空闲释放缓存: freed="
                                 + (freed / 1048576) + "MiB");
                     } finally {
@@ -1221,12 +1237,14 @@ class YTSabrSession {
                         int itag = item.itag.intValue();
                         if (item.isInit) {
                             initSegments.put(itag, media);
+                            mediaSeen = true;
                             if (item.formatId != null && item.formatId.length > 0) {
                                 initialized.put(String.valueOf(itag), item.formatId);
                             }
                         } else if (item.seq != null) {
                             int seq = item.seq.intValue();
                             segments.computeIfAbsent(itag, k -> new HashMap<>()).put(seq, media);
+                            mediaSeen = true;
                             Meta meta = new Meta();
                             meta.startMs = item.startMs;
                             meta.durationMs = item.durationMs;
