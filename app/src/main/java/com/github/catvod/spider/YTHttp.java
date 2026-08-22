@@ -33,6 +33,7 @@ final class YTHttp {
 
     private final OkHttpClient client;
     private final Map<String, String> baseHeaders = new HashMap<>();
+    private volatile boolean closed;
 
     YTHttp(Map<String, String> headers) {
         this(headers, null);
@@ -121,6 +122,7 @@ final class YTHttp {
 
     /** Fetches text with an optional per-call deadline for metadata requests. */
     String string(String url, Map<String, String> headers, long timeoutMs) {
+        if (closed) return "";
         OkHttpClient active = client;
         if (timeoutMs > 0) {
             active = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build();
@@ -196,6 +198,7 @@ final class YTHttp {
      * <p>The caller owns the returned {@link Result} and must close it.
      */
     Result postSabr(String url, byte[] payload, Map<String, String> headers, long rn) throws IOException {
+        if (closed) throw new IOException("Canceled: YouTube spider destroyed");
         String target = url + (url.contains("?") ? "&" : "?") + "rn=" + rn;
         Map<String, String> merged = new HashMap<>();
         merged.put("Content-Type", "application/x-protobuf");
@@ -204,12 +207,25 @@ final class YTHttp {
         merged.put("Accept-Encoding", "identity");
         if (headers != null) merged.putAll(headers);
         Request request = request(target, merged).post(RequestBody.create(payload, PROTOBUF)).build();
-        Response response = client.newCall(request).execute();
+        // Bound a single SABR call so a player that has already been released cannot leave an
+        // OkHttp worker waiting indefinitely on a dead CDN stream.
+        OkHttpClient active = client.newBuilder().callTimeout(8, TimeUnit.SECONDS).build();
+        Response response = active.newCall(request).execute();
         Result result = new Result();
         result.raw = response;
         result.code = response.code();
         result.contentType = response.header("content-type");
         return result;
+    }
+
+    void close() {
+        closed = true;
+        try {
+            client.dispatcher().cancelAll();
+            client.connectionPool().evictAll();
+        } catch (Throwable ignored) {
+            // Best-effort cancellation; in-flight callers also observe the closed flag.
+        }
     }
 
     /** @return true when an exception looks like a transient transport failure worth retrying. */
