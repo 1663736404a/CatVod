@@ -270,8 +270,11 @@ class YTSabrSession {
                 }
             }
 
-            // Only reset the session when the target genuinely lies outside the cache.
-            if (!wantInit && !cacheCovers(targetItag, targetMs)) {
+            // A cached segment can still be the wrong segment for this local number: the server
+            // may have skipped a native sequence while the broad cache interval still covers the
+            // requested time. Recover even when cacheCovers() is true, otherwise A can pump many
+            // HTTP-200 control responses and end in a 500 while audio continues.
+            if (!wantInit) {
                 byte[] recovered = stallRecover(cfg, videoItem, audioItem, targetItag, targetMs, dashSegMs, wantSeq);
                 if (recovered != null) {
                     result.media = recovered;
