@@ -55,7 +55,11 @@ final class YTPlay {
     private final Map<String, Long> refreshMarks = new HashMap<>();
     // A local MPD can outlive the host's current episode during sequential playback.
     // Include a generation in the SABR state key so a new extraction never reuses old UMP state.
-    private final Map<String, Long> sabrGenerations = new HashMap<>();
+    // Static: a Spider rebuilt after the host's registry clear must not restart the counter at 1 and
+    // collide with a state key the previous instance is still serving.
+    private static final Map<String, Long> sabrGenerations = new HashMap<>();
+    /** State keys created by this instance; only these may be torn down by it. */
+    private final Set<String> ownedStateKeys = Collections.synchronizedSet(new HashSet<>());
     private final Object sabrSwitchLock = new Object();
     private volatile boolean destroyed;
     private volatile boolean destroyRequested;
@@ -137,14 +141,25 @@ final class YTPlay {
             if (destroyed) return;
             destroyed = true;
             YTServer.unregister(ownerId);
-            synchronized (yt.sabrState) {
-                for (YTSabrSession value : yt.sabrState.values()) value.cancel();
-                yt.sabrState.clear();
+            // Cancel only the sessions this instance created. YouTubeLite.sabrState is now static so
+            // a rebuilt Spider can adopt a running session; wiping it wholesale here would kill the
+            // playback that survived the host's registry clear, which is the exact failure this is
+            // meant to prevent. Sessions nobody adopts are reaped by the producer's own idle exit.
+            synchronized (YouTubeLite.sabrState) {
+                for (String key : new ArrayList<>(ownedStateKeys)) {
+                    YTSabrSession value = YouTubeLite.sabrState.get(key);
+                    if (value == null) continue;
+                    // Another live YTPlay may have adopted this session after our grace period
+                    // started; only tear down sessions still attributed to us.
+                    if (!ownerId.equals(YouTubeLite.sabrOwners.get(key))) continue;
+                    value.cancel();
+                    YouTubeLite.sabrState.remove(key);
+                    YouTubeLite.sabrOwners.remove(key);
+                }
             }
-            try {
-                yt.http().close();
-            } catch (Throwable ignored) {
-            }
+            ownedStateKeys.clear();
+            // Do not close the shared HTTP client here: another Spider instance rebuilt after the
+            // host's clear may still be serving from a session that uses it.
             sabrCache.clear();
             playCache.clear();
         }
@@ -746,9 +761,14 @@ final class YTPlay {
         }
         String stateKey = vid + ":sabr:" + generation + ":" + selected.client + ":"
                 + selected.video.itag + ":" + selected.audio.itag;
-        synchronized (yt.sabrState) {
-            yt.sabrState.remove(stateKey);
+        synchronized (YouTubeLite.sabrState) {
+            YTSabrSession stale = YouTubeLite.sabrState.remove(stateKey);
+            YouTubeLite.sabrOwners.remove(stateKey);
+            // Activating a candidate means starting a fresh negotiation for this key, so any session
+            // still parked under it is genuinely dead. Cancel it rather than leaking its producer.
+            if (stale != null) stale.cancel();
         }
+        ownedStateKeys.remove(stateKey);
         data.activeIndex = index;
         data.videoItem = selected.video;
         data.audioItem = selected.audio;
@@ -785,17 +805,55 @@ final class YTPlay {
         }
     }
 
+    /**
+     * Returns the session for a state key, adopting one that survived a host registry clear.
+     *
+     * <p>When Android reclaims the backgrounded HomeActivity, the host destroys every Spider and
+     * empties its registry, then rebuilds a Spider on the next request. Because the session map is
+     * static, that rebuilt instance finds the still-running session here — same playback cookie, rn
+     * sequence and cached segments — instead of renegotiating from zero against a manifest the
+     * player is already using.
+     */
     private YTSabrSession session(String stateKey) {
-        synchronized (yt.sabrState) {
-            YTSabrSession found = yt.sabrState.get(stateKey);
-            if (found != null) return found;
+        synchronized (YouTubeLite.sabrState) {
+            YTSabrSession found = YouTubeLite.sabrState.get(stateKey);
+            // A cancelled session must never be adopted: its media cache is already released and its
+            // pump refuses to run, so it would answer every request with an error.
+            if (found != null && found.isCanceled()) {
+                YouTubeLite.sabrState.remove(stateKey);
+                YouTubeLite.sabrOwners.remove(stateKey);
+                found = null;
+            }
+            if (found != null) {
+                if (ownedStateKeys.add(stateKey)) {
+                    com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 会话接管: key=" + stateKey);
+                }
+                YouTubeLite.sabrOwners.put(stateKey, ownerId);
+                return found;
+            }
             YTSabrSession created = new YTSabrSession(yt.http(),
                     (int) YouTubeLite.optLong(ext, "sabr_max_parts", 4096),
                     YouTubeLite.optLong(ext, "sabr_video_cache_bytes", videoCacheBudget()),
                     YouTubeLite.optLong(ext, "sabr_audio_cache_bytes", audioCacheBudget()),
                     (int) YouTubeLite.optLong(ext, "sabr_segment_fetch_requests", 14));
-            yt.sabrState.put(stateKey, created);
+            YouTubeLite.sabrState.put(stateKey, created);
+            YouTubeLite.sabrOwners.put(stateKey, ownerId);
+            ownedStateKeys.add(stateKey);
+            reapIdleSessions();
             return created;
+        }
+    }
+
+    /** Drops sessions whose producer already self-terminated, bounding the static map. */
+    private static void reapIdleSessions() {
+        if (YouTubeLite.sabrState.size() <= 6) return;
+        for (String key : new ArrayList<>(YouTubeLite.sabrState.keySet())) {
+            YTSabrSession value = YouTubeLite.sabrState.get(key);
+            if (value == null || !value.isIdle()) continue;
+            value.cancel();
+            YouTubeLite.sabrState.remove(key);
+            YouTubeLite.sabrOwners.remove(key);
+            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 会话回收: key=" + key);
         }
     }
 
@@ -857,9 +915,12 @@ final class YTPlay {
     private void resetSabr(String vid, String cacheKey) {
         SabrData old = sabrCache.remove(cacheKey);
         if (old == null || old.stateKey == null) return;
-        synchronized (yt.sabrState) {
-            yt.sabrState.remove(old.stateKey);
+        synchronized (YouTubeLite.sabrState) {
+            YTSabrSession stale = YouTubeLite.sabrState.remove(old.stateKey);
+            YouTubeLite.sabrOwners.remove(old.stateKey);
+            if (stale != null) stale.cancel();
         }
+        ownedStateKeys.remove(old.stateKey);
     }
 
     /* ------------------------------------------------------------------ */
