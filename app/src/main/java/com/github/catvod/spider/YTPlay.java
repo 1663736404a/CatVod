@@ -58,6 +58,8 @@ final class YTPlay {
     // Static: a Spider rebuilt after the host's registry clear must not restart the counter at 1 and
     // collide with a state key the previous instance is still serving.
     private static final Map<String, Long> sabrGenerations = new HashMap<>();
+    /** Candidate signature behind each generation, so re-activating the same one does not bump it. */
+    private static final Map<String, String> sabrSignatures = new HashMap<>();
     /** State keys created by this instance; only these may be torn down by it. */
     private final Set<String> ownedStateKeys = Collections.synchronizedSet(new HashSet<>());
     private final Object sabrSwitchLock = new Object();
@@ -232,10 +234,29 @@ final class YTPlay {
         return Proxy.getUrl() + "?do=csp&siteKey=" + siteKey + params;
     }
 
+    /**
+     * Identity of a SABR session: video + quality + bridge, deliberately WITHOUT {@code sid}.
+     *
+     * <p>{@code sid} comes from {@code playerContent}, which increments a counter on every single
+     * play request. Including it meant replaying the same video produced a brand new cache key, a
+     * new generation and therefore a cold session, while the warm one (already holding a negotiated
+     * cookie and an indexed timeline) was orphaned. The log shows exactly that: a manifest reporting
+     * {@code videoReal=7} was followed 3s later by one reporting {@code videoReal=0} for the same
+     * video, then {@code Canceled: SABR session closed} and HTTP 503 on the init segments.
+     *
+     * <p>That is why resuming a video with a watch-history position was the worst case: resuming
+     * always issues a fresh play request, so it always started cold and had to renegotiate before
+     * the player's 12s segment deadline. Entering a second time appeared to "fix" it only because
+     * the extract cache had warmed by then.
+     *
+     * <p>Switching to a different video is handled explicitly by {@link #cancelOtherVideos(String)},
+     * and a genuine client failover still bumps the generation inside {@link #activate}, so dropping
+     * {@code sid} does not let stale state leak across episodes.
+     */
     private static String sabrCacheKey(String vid, String quality, String sid, boolean b) {
         String key = (b ? "yt_sabr_b_" : "yt_sabr_") + vid;
         if (!"best".equals(quality)) key += "_" + quality;
-        return TextUtils.isEmpty(sid) ? key : key + ":sid=" + sid;
+        return key;
     }
 
     /* ------------------------------------------------------------------ */
@@ -759,22 +780,40 @@ final class YTPlay {
         if (index < 0 || index >= data.candidates.size()) return null;
         Candidate selected = data.candidates.get(index);
         String generationKey = (cacheKey == null ? "yt_sabr_" + vid : cacheKey);
+        // Reuse the current generation when re-activating the identical candidate. Bumping it
+        // unconditionally discarded a live, already-negotiated session on every replay of the same
+        // video and forced a cold restart. Only a real candidate change (client failover) needs a
+        // new generation, because only then is the old UMP state genuinely incompatible.
+        String signature = selected.client + ":" + selected.video.itag + ":" + selected.audio.itag;
         long generation;
         synchronized (sabrGenerations) {
-            generation = sabrGenerations.containsKey(generationKey)
-                    ? sabrGenerations.get(generationKey) + 1L : 1L;
-            sabrGenerations.put(generationKey, generation);
+            Long current = sabrGenerations.get(generationKey);
+            String previous = sabrSignatures.get(generationKey);
+            if (current != null && signature.equals(previous)) {
+                generation = current;
+            } else {
+                generation = current == null ? 1L : current + 1L;
+                sabrGenerations.put(generationKey, generation);
+                sabrSignatures.put(generationKey, signature);
+            }
         }
-        String stateKey = vid + ":sabr:" + generation + ":" + selected.client + ":"
-                + selected.video.itag + ":" + selected.audio.itag;
+        String stateKey = vid + ":sabr:" + generation + ":" + signature;
+        boolean reused;
         synchronized (YouTubeLite.sabrState) {
-            YTSabrSession stale = YouTubeLite.sabrState.remove(stateKey);
-            YouTubeLite.sabrOwners.remove(stateKey);
-            // Activating a candidate means starting a fresh negotiation for this key, so any session
-            // still parked under it is genuinely dead. Cancel it rather than leaking its producer.
-            if (stale != null) stale.cancel();
+            // Keep a session already parked under this exact key: same video, same candidate, same
+            // generation means the negotiated state is still valid and reusable.
+            reused = YouTubeLite.sabrState.containsKey(stateKey)
+                    && !YouTubeLite.sabrState.get(stateKey).isCanceled();
+            if (!reused) {
+                YTSabrSession stale = YouTubeLite.sabrState.remove(stateKey);
+                YouTubeLite.sabrOwners.remove(stateKey);
+                if (stale != null) stale.cancel();
+                ownedStateKeys.remove(stateKey);
+            }
         }
-        ownedStateKeys.remove(stateKey);
+        if (reused) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 复用会话: key=" + stateKey);
+        }
         data.activeIndex = index;
         data.videoItem = selected.video;
         data.audioItem = selected.audio;
@@ -1243,8 +1282,14 @@ final class YTPlay {
             // next manifest fetch, so start it here instead of waiting 12s for a timeout.
             active.startProducer(data.videoItem, data.audioItem,
                     Math.max(1000L, data.duration * 1000L));
+            // A cold session must negotiate before it can answer, and one SABR pump at 2160p was
+            // measured at 6-18s of pure download. A flat 12s deadline therefore expired mid-fetch
+            // and returned 503 even though the transfer was healthy, which the player reports as a
+            // connection timeout. Give a session that has not produced anything yet more room, and
+            // keep the short deadline once it is warm so a genuine stall is still caught quickly.
+            long deadline = active.hasMedia() ? 12000L : 25000L;
             YTSabrSession.Found found = active
-                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, 12000L);
+                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, deadline);
             if (found == null || found.media == null || found.media.length == 0) {
                 return text(503, "SABR-B 未产生目标时间媒体");
             }
