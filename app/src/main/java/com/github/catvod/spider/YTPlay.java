@@ -1275,38 +1275,73 @@ final class YTPlay {
                 return text(400, "无效 SABR-B 时间段");
             }
         }
-        try {
-            YTSabrSession active = session(stateKey);
-            // A segment request can arrive against a session that was just replaced (the previous
-            // one cancelled on a video switch, or reaped). A fresh session has no producer until the
-            // next manifest fetch, so start it here instead of waiting 12s for a timeout.
-            active.startProducer(data.videoItem, data.audioItem,
-                    Math.max(1000L, data.duration * 1000L));
-            // A cold session must negotiate before it can answer, and one SABR pump at 2160p was
-            // measured at 6-18s of pure download. A flat 12s deadline therefore expired mid-fetch
-            // and returned 503 even though the transfer was healthy, which the player reports as a
-            // connection timeout. Give a session that has not produced anything yet more room, and
-            // keep the short deadline once it is warm so a genuine stall is still caught quickly.
-            long deadline = active.hasMedia() ? 12000L : 25000L;
-            YTSabrSession.Found found = active
-                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, deadline);
-            if (found == null || found.media == null || found.media.length == 0) {
-                return text(503, "SABR-B 未产生目标时间媒体");
+        // Two attempts: the second one runs against a freshly extracted player response, which is
+        // the only way to recover when the server sends RELOAD_PLAYER_RESPONSE (UMP part 46).
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                YTSabrSession active = session(stateKey);
+                // A segment request can arrive against a session that was just replaced (the previous
+                // one cancelled on a video switch, or reaped). A fresh session has no producer until
+                // the next manifest fetch, so start it here instead of waiting for a timeout.
+                active.startProducer(data.videoItem, data.audioItem,
+                        Math.max(1000L, data.duration * 1000L));
+                // A cold session must negotiate before it can answer, and one SABR pump at 2160p was
+                // measured at 6-18s of pure download. A flat 12s deadline therefore expired mid-fetch
+                // and returned 503 even though the transfer was healthy, which the player reports as
+                // a connection timeout. Give a cold session more room, and keep the short deadline
+                // once it is warm so a genuine stall is still caught quickly.
+                long deadline = active.hasMedia() ? 12000L : 25000L;
+                YTSabrSession.Found found = active
+                        .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, deadline);
+                if (found == null || found.media == null || found.media.length == 0) {
+                    return text(503, "SABR-B 未产生目标时间媒体");
+                }
+                String contentType = mimeBase(fallback(item.mimeType,
+                        "video".equals(track) ? "video/webm" : "audio/webm"));
+                Map<String, String> headers = new LinkedHashMap<>();
+                headers.put("Content-Type", contentType);
+                headers.put("Content-Length", String.valueOf(found.media.length));
+                headers.put("Cache-Control", "private, max-age=30");
+                headers.put("Accept-Ranges", "none");
+                return bytes(200, contentType, found.media, headers);
+            } catch (YTSabrSession.ReloadRequired reload) {
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 需重新提取: track=" + track
+                        + ", attempt=" + attempt + ", reason=" + reload.getMessage());
+                if (attempt > 0) return text(503, "SABR-B 需重新提取但重试已用尽");
+                SabrData rebuilt = reextract(vid, quality, cacheKey);
+                if (rebuilt == null) return text(503, "SABR-B 重新提取失败");
+                data = rebuilt;
+                item = "video".equals(track) ? data.videoItem : data.audioItem;
+                stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+            } catch (Throwable e) {
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 取段失败: track=" + track
+                        + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
+                        + ", error=" + String.valueOf(e));
+                return text(503, "SABR-B 取段失败: " + String.valueOf(e));
             }
-            String contentType = mimeBase(fallback(item.mimeType,
-                    "video".equals(track) ? "video/webm" : "audio/webm"));
-            Map<String, String> headers = new LinkedHashMap<>();
-            headers.put("Content-Type", contentType);
-            headers.put("Content-Length", String.valueOf(found.media.length));
-            headers.put("Cache-Control", "private, max-age=30");
-            headers.put("Accept-Ranges", "none");
-            return bytes(200, contentType, found.media, headers);
-        } catch (Throwable e) {
-            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 取段失败: track=" + track
-                    + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
-                    + ", error=" + String.valueOf(e));
-            return text(503, "SABR-B 取段失败: " + String.valueOf(e));
         }
+        return text(503, "SABR-B 取段失败");
+    }
+
+    /**
+     * Discards the cached player response for a video and extracts a fresh one.
+     *
+     * <p>Required when the server answers with {@code RELOAD_PLAYER_RESPONSE}: the streaming URL and
+     * ustreamer config are bound to a player response that has expired, so no amount of retrying the
+     * same payload will ever return media. Also clears the extraction cache, otherwise the rebuild
+     * would hand back the identical stale config.
+     */
+    private SabrData reextract(String vid, String quality, String cacheKey) {
+        resetSabr(vid, cacheKey);
+        try {
+            yt.invalidateExtract(vid);
+        } catch (Throwable ignored) {
+            // Best effort: a forced extract below still refreshes most of the state.
+        }
+        synchronized (refreshMarks) {
+            refreshMarks.remove(cacheKey);
+        }
+        return sabrData(vid, quality, cacheKey, true);
     }
 
     /**
