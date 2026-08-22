@@ -906,7 +906,7 @@ final class YTPlay {
             // first MEDIA_HEADERs. A target-time request then pumps until the first real media
             // interval is cached. Later MPD requests reuse this same session and cache.
             sabr.getSegment(data.videoItem, data.audioItem, track, "init");
-            sabr.getSegment(data.videoItem, data.audioItem, track, "t=0&n=1");
+            sabr.getSegment(data.videoItem, data.audioItem, track, "t=0");
             int itag = "video".equals(track) ? data.videoItem.itag : data.audioItem.itag;
             return sabr.snapshotTimeline(itag);
         } catch (Throwable e) {
@@ -1024,10 +1024,10 @@ final class YTPlay {
             return text(404, "SABR-B 缓存不存在");
         }
         YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
-        // B keeps independent audio/video SABR sessions. A 4K video pump can take seconds; sharing
-        // its lock with audio is exactly what produced the previous "画面卡、声音断" pattern.
-        String stateKey = (data.stateKey == null ? vid + ":sabr:b" : data.stateKey)
-                + ":" + track;
+        // Keep one SABR protocol session for both tracks. The playback cookie, rn sequence and
+        // buffered context are shared by the video and audio itags; the session lock is fair so
+        // a large 4K video pump still yields between requests.
+        String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
         String requested = "init".equals(segment) ? "init" : null;
         if (requested == null) {
             if (!segment.startsWith("t=")) return text(400, "无效 SABR-B 时间段");
@@ -1042,8 +1042,11 @@ final class YTPlay {
             }
         }
         try {
-            YTSabrSession.Found found = session(stateKey)
-                    .getSegment(data.videoItem, data.audioItem, track, requested);
+            YTSabrSession.Found found = null;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                found = session(stateKey).getSegment(data.videoItem, data.audioItem, track, requested);
+                if (found != null && found.media != null && found.media.length > 0) break;
+            }
             if (found == null || found.media == null || found.media.length == 0) {
                 return text(503, "SABR-B 未产生目标时间媒体");
             }
