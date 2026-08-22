@@ -1285,12 +1285,16 @@ final class YTPlay {
                 // the next manifest fetch, so start it here instead of waiting for a timeout.
                 active.startProducer(data.videoItem, data.audioItem,
                         Math.max(1000L, data.duration * 1000L));
-                // A cold session must negotiate before it can answer, and one SABR pump at 2160p was
-                // measured at 6-18s of pure download. A flat 12s deadline therefore expired mid-fetch
-                // and returned 503 even though the transfer was healthy, which the player reports as
-                // a connection timeout. Give a cold session more room, and keep the short deadline
-                // once it is warm so a genuine stall is still caught quickly.
-                long deadline = active.hasMedia() ? 12000L : 25000L;
+                // hasMedia() only means that SOME segment exists. It does not mean the requested
+                // seek target is cached. This is especially important when playback resumes at
+                // 64s: the producer was started by the MPD request at t=0, while Exo immediately
+                // asks for t=64s. The old warm-session 12s deadline returned 503 during a healthy
+                // 4K pump (measured 6-18s), which Exo surfaced as "connection timeout".
+                // Target-time requests therefore always get the cold/seek deadline. The endpoint
+                // must wait for the producer to reposition and publish a complete MEDIA_END segment.
+                long deadline = "init".equals(requested) ? 12000L : 30000L;
+                SpiderDebug.log("YouTube SABR-B 等待目标: track=" + track + ", segment=" + requested
+                        + ", deadlineMs=" + deadline + ", hasMedia=" + active.hasMedia());
                 YTSabrSession.Found found = active
                         .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, deadline);
                 if (found == null || found.media == null || found.media.length == 0) {
