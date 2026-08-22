@@ -90,6 +90,22 @@ class YTSabrSession {
     private volatile boolean consumerSeen;
     /** True once any media has been cached; drives the warm/cold segment deadline. */
     private volatile boolean mediaSeen;
+    /** Set when the server asked us to re-extract the player response (UMP part 46). */
+    private volatile boolean reloadRequested;
+    /** Consecutive pumps that returned no media at all; guards against an infinite retry loop. */
+    private int emptyPumps;
+
+    /** Raised when the server requires a fresh player response before it will serve media. */
+    static class ReloadRequired extends Exception {
+        ReloadRequired(String message) {
+            super(message);
+        }
+    }
+
+    /** True when this session can no longer produce media and must be rebuilt by the caller. */
+    boolean needsReload() {
+        return reloadRequested;
+    }
 
     private byte[] playbackCookie;
     private String url;
@@ -314,7 +330,7 @@ class YTSabrSession {
             }
         }
         long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
-        while (!canceled && System.currentTimeMillis() < deadline) {
+        while (!canceled && !reloadRequested && System.currentTimeMillis() < deadline) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) break;
             if (!lock.tryLock(Math.min(100L, remaining), TimeUnit.MILLISECONDS)) continue;
@@ -336,6 +352,7 @@ class YTSabrSession {
                         Math.max(1L, deadline - System.currentTimeMillis())));
             }
         }
+        if (reloadRequested) throw new ReloadRequired("SABR session needs a fresh player response");
         Found timeout = new Found();
         timeout.error = canceled ? "producer canceled" : "producer target timeout";
         timeout.targetMs = targetMs;
@@ -343,7 +360,7 @@ class YTSabrSession {
     }
 
     private void producerLoop() {
-        while (!canceled) {
+        while (!canceled && !reloadRequested) {
             YTFormat videoItem;
             YTFormat audioItem;
             long goal;
@@ -409,6 +426,14 @@ class YTSabrSession {
                             ? videoItem.sabrConfig : audioItem.sabrConfig;
                     pumpOnce(cfg, videoItem, audioItem);
                 }
+            } catch (ReloadRequired reload) {
+                // Nothing this producer can do: the session needs a new player response, which only
+                // the caller can obtain. Stop instead of hammering a dead payload.
+                SpiderDebug.log("YouTube SABR-B producer 需重新提取, 退出: " + reload.getMessage());
+                synchronized (producerMonitor) {
+                    producerMonitor.notifyAll();
+                }
+                return;
             } catch (Throwable error) {
                 if (canceled) return;
                 SpiderDebug.log("YouTube SABR-B producer: " + String.valueOf(error));
@@ -1270,6 +1295,14 @@ class YTSabrSession {
                         // Per googlevideo's handleSabrError this must abort the request and let the
                         // caller retry; merely logging leaves the caller with empty data.
                         throw new Exception("SABR error type=" + errType + " action=" + errAction);
+                    } else if (part.id == YTSabr.RELOAD_PLAYER_RESPONSE) {
+                        // The server is telling us the player response backing this session is stale
+                        // and must be re-extracted. It was previously parsed as an anonymous control
+                        // part and dropped, so the pump kept replaying the same dead payload: 197
+                        // consecutive HTTP 200 responses with completed=0/initialized=0, no media at
+                        // all, while the player waited and reported a connection timeout.
+                        reloadRequested = true;
+                        throw new ReloadRequired("SABR reload player response requested");
                     } else if (part.id == YTSabr.SABR_CONTEXT_UPDATE) {
                         // SabrContextUpdate: type=1, scope=2, value=3, send_by_default=4
                         Long ctxType = YTProto.getInt(part.data, 1);
@@ -1319,6 +1352,19 @@ class YTSabrSession {
             SpiderDebug.log("YouTube SABR 处理完成: rn=" + requestCount + ", completed=" + completed
                     + ", initialized=" + initialized.size() + ", videoCached=" + initSegments.containsKey(videoItag)
                     + ", audioCached=" + initSegments.containsKey(audioItag));
+            // Circuit breaker. A server that keeps answering 200 with only control parts will never
+            // start serving media on its own, and retrying forever just burns requests while the
+            // player sits at zero buffer (observed: 197 pumps, all completed=0). Treat a long empty
+            // streak as "this session is dead" so the caller re-extracts instead of spinning.
+            if (completed == 0) {
+                if (++emptyPumps >= 8) {
+                    reloadRequested = true;
+                    SpiderDebug.log("YouTube SABR 连续空响应, 需重新提取: emptyPumps=" + emptyPumps);
+                    throw new ReloadRequired("SABR produced no media for " + emptyPumps + " pumps");
+                }
+            } else {
+                emptyPumps = 0;
+            }
             if (redirectUrl != null && completed == 0) {
                 target = redirectUrl;
                 // Redirect parts can update the playback cookie/policy. Rebuild from the latest
