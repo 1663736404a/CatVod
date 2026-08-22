@@ -37,10 +37,15 @@ final class YTPlay {
     private static final long SABR_CACHE_MS = 1800 * 1000L;
     private static final String[] RISKY_AUDIO = {"ec-3", "ec3", "eac3", "ac-3", "ac3", "dts", "truehd"};
 
+    private static final java.util.concurrent.atomic.AtomicLong OWNER_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+
     private final YouTubeLite yt;
     private final Map<String, String> header;
     private final JsonObject ext;
     private final String siteKey;
+    /** Identifies this YTPlay instance inside {@link YTServer}'s owner registry. */
+    private final String ownerId = "p" + OWNER_SEQ.incrementAndGet();
 
     private final Map<String, PlayData> playCache = new HashMap<>();
     private final Map<String, SabrData> sabrCache = new HashMap<>();
@@ -63,6 +68,7 @@ final class YTPlay {
         this.header = header;
         this.ext = ext;
         this.siteKey = siteKey;
+        YTServer.register(ownerId, this);
     }
 
     /** Cached direct-play tracks for one {@code vid + quality} pair. */
@@ -129,6 +135,7 @@ final class YTPlay {
         synchronized (destroyMonitor) {
             if (destroyed) return;
             destroyed = true;
+            YTServer.unregister(ownerId);
             synchronized (yt.sabrState) {
                 for (YTSabrSession value : yt.sabrState.values()) value.cancel();
                 yt.sabrState.clear();
@@ -173,9 +180,29 @@ final class YTPlay {
         }
     }
 
-    /** Absolute local-proxy URL, usable inside a manifest. */
+    /**
+     * Absolute media URL, usable inside a manifest.
+     *
+     * <p>Prefers this JAR's own loopback server. The host's {@code /proxy} endpoint stops routing
+     * into this JAR the moment the host clears its jar-loader registry (logged as
+     * {@code base-loader: clear reason=mobile-home-destroy}), after which every segment request is
+     * answered with HTTP 500 {@code null_or_empty} and the player dies once its buffer drains.
+     * {@link YTServer} keeps serving because this JAR owns the socket.
+     */
     String localUrl(String params) {
+        String owned = YTServer.url(ownerId, siteKey, params);
+        if (owned != null) return owned;
         return Proxy.getUrl() + "?do=csp&siteKey=" + siteKey + params;
+    }
+
+    /**
+     * Top-level manifest URL handed to the player. Falls back to the host's {@code proxy://}
+     * scheme only when this JAR's own server could not be opened.
+     */
+    String manifestUrl(String params) {
+        String owned = YTServer.url(ownerId, siteKey, params);
+        if (owned != null) return owned;
+        return Proxy.getUrl(siteKey, params);
     }
 
     private static String sabrCacheKey(String vid, String quality, String sid, boolean b) {
@@ -758,12 +785,33 @@ final class YTPlay {
             if (found != null) return found;
             YTSabrSession created = new YTSabrSession(yt.http(),
                     (int) YouTubeLite.optLong(ext, "sabr_max_parts", 4096),
-                    YouTubeLite.optLong(ext, "sabr_video_cache_bytes", 576L * 1024 * 1024),
-                    YouTubeLite.optLong(ext, "sabr_audio_cache_bytes", 48L * 1024 * 1024),
+                    YouTubeLite.optLong(ext, "sabr_video_cache_bytes", videoCacheBudget()),
+                    YouTubeLite.optLong(ext, "sabr_audio_cache_bytes", audioCacheBudget()),
                     (int) YouTubeLite.optLong(ext, "sabr_segment_fetch_requests", 14));
             yt.sabrState.put(stateKey, created);
             return created;
         }
+    }
+
+    /**
+     * Video cache ceiling, derived from the real Java heap rather than a fixed number.
+     *
+     * <p>The previous 576 MiB default exceeded the whole heap on common devices (observed limit:
+     * 512 MiB). A 2160p segment here is ~19.6 MiB, so a handful of them plus the host player's own
+     * allocator pushed the process to 424 MiB used, at which point the host demoted its buffer to
+     * {@code capacity-limited} (134 MiB → 24 MiB) and preloading stopped. Cap at a quarter of the
+     * heap, clamped to a range that still holds enough segments for retries.
+     */
+    private static long videoCacheBudget() {
+        long max = Runtime.getRuntime().maxMemory();
+        long quarter = max <= 0 ? 96L * 1024 * 1024 : max / 4;
+        return Math.max(64L * 1024 * 1024, Math.min(160L * 1024 * 1024, quarter));
+    }
+
+    private static long audioCacheBudget() {
+        long max = Runtime.getRuntime().maxMemory();
+        long share = max <= 0 ? 16L * 1024 * 1024 : max / 32;
+        return Math.max(12L * 1024 * 1024, Math.min(32L * 1024 * 1024, share));
     }
 
     private SabrData sabrData(String vid, String quality, String cacheKey, boolean rebuild) {

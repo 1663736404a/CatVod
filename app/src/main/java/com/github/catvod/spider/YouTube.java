@@ -187,12 +187,18 @@ public class YouTube extends Spider {
         // YouTube playback is SABR-only here. Keep A (the experimental SegmentTemplate bridge)
         // and B (the SegmentBase bridge) as explicit choices; do not mix direct URLs into this menu.
         List<String> urls = new ArrayList<>();
+        // Manifest URLs must come from the JAR-owned media server for the same reason its segment
+        // URLs do: after the host clears its jar-loader registry the proxy:// scheme resolves to a
+        // handler that no longer reaches this JAR, so a re-prepare (decoder fallback, seek, retry)
+        // gets HTTP 500 instead of the manifest and the player reports a fatal source error.
+        String aParams = "&type=sabr_mpd&vid=" + Uri.encode(videoId)
+                + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
+        String bParams = "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
+                + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
         urls.add("sabr•A");
-        urls.add(Proxy.getUrl(siteKey, "&type=sabr_mpd&vid=" + Uri.encode(videoId)
-                + "&quality=" + Uri.encode(quality) + "&sid=" + sid));
+        urls.add(play.manifestUrl(aParams));
         urls.add("sabr•B");
-        urls.add(Proxy.getUrl(siteKey, "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
-                + "&quality=" + Uri.encode(quality) + "&sid=" + sid));
+        urls.add(play.manifestUrl(bParams));
         return Result.get().url(urls).dash().string();
     }
 
