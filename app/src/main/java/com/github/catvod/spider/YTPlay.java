@@ -53,6 +53,10 @@ final class YTPlay {
     private final Map<String, Long> sabrGenerations = new HashMap<>();
     private final Object sabrSwitchLock = new Object();
     private volatile boolean destroyed;
+    private volatile boolean destroyRequested;
+    private volatile long lastProxyAt;
+    private volatile boolean destroyScheduled;
+    private final Object destroyMonitor = new Object();
 
     YTPlay(YouTubeLite yt, Map<String, String> header, JsonObject ext, String siteKey) {
         this.yt = yt;
@@ -97,16 +101,49 @@ final class YTPlay {
     /* ------------------------------------------------------------------ */
 
     void destroy() {
-        destroyed = true;
-        synchronized (yt.sabrState) {
-            for (YTSabrSession value : yt.sabrState.values()) value.cancel();
-            yt.sabrState.clear();
+        // The host may call destroy() for mobile-home-destroy while the player still owns the
+        // proxy URL. Defer hard teardown until the proxy has been idle for a grace period.
+        destroyRequested = true;
+        lastProxyAt = System.currentTimeMillis();
+        synchronized (destroyMonitor) {
+            if (destroyed || destroyScheduled) return;
+            destroyScheduled = true;
+            Thread deferred = new Thread(() -> {
+                while (!destroyed) {
+                    try {
+                        Thread.sleep(30000L);
+                    } catch (InterruptedException ignored) {
+                    }
+                    if (System.currentTimeMillis() - lastProxyAt >= 30000L) {
+                        hardDestroy();
+                        return;
+                    }
+                }
+            }, "youtube-deferred-destroy");
+            deferred.setDaemon(true);
+            deferred.start();
         }
-        sabrCache.clear();
-        playCache.clear();
+    }
+
+    private void hardDestroy() {
+        synchronized (destroyMonitor) {
+            if (destroyed) return;
+            destroyed = true;
+            synchronized (yt.sabrState) {
+                for (YTSabrSession value : yt.sabrState.values()) value.cancel();
+                yt.sabrState.clear();
+            }
+            try {
+                yt.http().close();
+            } catch (Throwable ignored) {
+            }
+            sabrCache.clear();
+            playCache.clear();
+        }
     }
 
     Object[] proxy(Map<String, String> params) {
+        lastProxyAt = System.currentTimeMillis();
         if (destroyed) return text(499, "YouTube 播放会话已关闭");
         String type = params.get("type");
         if (type == null) return null;
@@ -857,6 +894,8 @@ final class YTPlay {
         bSession.startProducer(data.videoItem, data.audioItem, durationMs);
         // The producer owns SABR I/O. Snapshot only what is already indexed; later media requests
         // continue using the producer's real MEDIA_HEADER time/native-sequence index.
+        // Do not fetch a direct URL/index on the MPD request thread. B's only source of truth is
+        // the SABR producer's MEDIA_HEADER index; the producer will extend it while playback runs.
         List<YTFormat.Seg> videoReal = bSession.snapshotTimeline(data.videoItem.itag);
         List<YTFormat.Seg> audioReal = bSession.snapshotTimeline(data.audioItem.itag);
         String videoRows = timeRows(videoReal, durationMs, sabrRequestGridMs(data.videoItem, true));
@@ -1049,7 +1088,7 @@ final class YTPlay {
         }
         try {
             YTSabrSession.Found found = session(stateKey)
-                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, 7000L);
+                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, 12000L);
             if (found == null || found.media == null || found.media.length == 0) {
                 return text(503, "SABR-B 未产生目标时间媒体");
             }

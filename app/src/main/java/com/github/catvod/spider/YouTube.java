@@ -203,12 +203,10 @@ public class YouTube extends Spider {
 
     @Override
     public void destroy() {
+        // The host may destroy the catalog loader while the player still owns this Spider.
+        // YTPlay keeps the proxy/session alive during its grace period; do not null the proxy or
+        // close OkHttp here, otherwise the player's in-flight URL is killed immediately.
         if (play != null) play.destroy();
-        if (http != null) http.close();
-        youtubeProxy = null;
-        play = null;
-        yt = null;
-        http = null;
     }
 
     @Override
