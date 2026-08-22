@@ -727,11 +727,12 @@ final class YTPlay {
         }
         if (data == null && rebuild) {
             Object lock;
+            String extractLockKey = vid;
             synchronized (sabrExtractLocks) {
-                lock = sabrExtractLocks.get(cacheKey);
+                lock = sabrExtractLocks.get(extractLockKey);
                 if (lock == null) {
                     lock = new Object();
-                    sabrExtractLocks.put(cacheKey, lock);
+                    sabrExtractLocks.put(extractLockKey, lock);
                 }
             }
             synchronized (lock) {
