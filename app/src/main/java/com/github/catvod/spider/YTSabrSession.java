@@ -88,9 +88,16 @@ class YTSabrSession {
     private volatile long lastTouchAt;
     /** True once the player has actually asked for a segment. */
     private volatile boolean consumerSeen;
+    /** True once a target-time segment request has established where the player really is. */
+    private boolean consumerTargetSeen;
     /** True once any media has been cached; drives the warm/cold segment deadline. */
     private volatile boolean mediaSeen;
-    /** Set when the server asked us to re-extract the player response (UMP part 46). */
+    /**
+     * Set when the server sent RELOAD_PLAYER_RESPONSE (UMP part 46). Informational only: the frame
+     * is advisory and routinely accompanies a session that goes on to serve media normally.
+     */
+    private volatile boolean reloadAdvised;
+    /** Set only when the session has proven it cannot produce media and must be rebuilt. */
     private volatile boolean reloadRequested;
     /** Consecutive pumps that returned no media at all; guards against an infinite retry loop. */
     private int emptyPumps;
@@ -242,10 +249,26 @@ class YTSabrSession {
 
     /** Starts one background producer for B's real-time index and media cache. */
     void startProducer(YTFormat videoItem, YTFormat audioItem, long durationMs) {
+        startProducer(videoItem, audioItem, durationMs, -1L);
+    }
+
+    /**
+     * Starts the background producer, optionally seeded with the player's starting position.
+     *
+     * <p>{@code startAtMs} matters for resume-from-history playback. Without it
+     * {@code producerTargetMs} stays at 0, so the producer prefetches from the beginning of the
+     * video while the player is asking for a segment two minutes in. The player then waits out its
+     * deadline and reports a connection timeout even though bytes are arriving at full speed - the
+     * producer is simply downloading the wrong part of the file.
+     */
+    void startProducer(YTFormat videoItem, YTFormat audioItem, long durationMs, long startAtMs) {
         synchronized (producerMonitor) {
             producerVideoItem = videoItem;
             producerAudioItem = audioItem;
             producerDurationMs = Math.max(0L, durationMs);
+            // Only ever move the target forward from a cold start; a live session's target is owned
+            // by awaitProducedSegment, which tracks the real playback position.
+            if (startAtMs > 0 && producerTargetMs <= 0) producerTargetMs = startAtMs;
             // startProducer runs from the MPD request, before any segment is asked for. Count it as
             // a touch rather than a consumer hit so the startup grace period applies.
             lastTouchAt = System.currentTimeMillis();
@@ -313,14 +336,34 @@ class YTSabrSession {
         boolean rewind = false;
         synchronized (producerMonitor) {
             if (!init) {
-                rewind = targetMs + 15000L < producerTargetMs;
+                // A big FORWARD jump needs a reposition too, not just a raised target. Resume from
+                // history is exactly that: the producer starts at 0 and is busy fetching the opening
+                // segments while the player asks for something two minutes in. Raising the target
+                // alone left it grinding through everything in between, so the player timed out
+                // while bytes were arriving at full speed.
+                long ahead = targetMs - producerTargetMs;
+                boolean jumpForward = targetMs > 0 && (!consumerTargetSeen || ahead > 30000L);
+                rewind = targetMs + 15000L < producerTargetMs || jumpForward;
                 producerTargetMs = rewind ? targetMs : Math.max(producerTargetMs, targetMs);
+                consumerTargetSeen = true;
             }
             producerMonitor.notifyAll();
         }
         if (rewind) {
-            lock.lock();
+            // Bounded: the producer can hold this lock for a whole pump (measured up to ~8s), and
+            // burning that here would eat most of the caller's deadline before we even start
+            // waiting for media. If we cannot reposition now the raised target still applies, so
+            // the producer moves to the right region on its next iteration.
+            boolean repositioned = false;
             try {
+                repositioned = lock.tryLock(1500L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            if (!repositioned) {
+                SpiderDebug.log("YouTube SABR 重定位延后(producer 持锁): targetMs=" + targetMs);
+            }
+            if (repositioned) try {
                 if (!canceled) {
                     playbackCookie = null;
                     seek(targetMs);
@@ -1311,13 +1354,16 @@ class YTSabrSession {
                         // caller retry; merely logging leaves the caller with empty data.
                         throw new Exception("SABR error type=" + errType + " action=" + errAction);
                     } else if (part.id == YTSabr.RELOAD_PLAYER_RESPONSE) {
-                        // The server is telling us the player response backing this session is stale
-                        // and must be re-extracted. It was previously parsed as an anonymous control
-                        // part and dropped, so the pump kept replaying the same dead payload: 197
-                        // consecutive HTTP 200 responses with completed=0/initialized=0, no media at
-                        // all, while the player waited and reported a connection timeout.
-                        reloadRequested = true;
-                        throw new ReloadRequired("SABR reload player response requested");
+                        // Advisory, NOT fatal. Treating it as fatal was a mistake: this part arrives
+                        // on rn=1 of a session, so re-extracting produced a new session whose rn=1
+                        // got the same part again - a self-perpetuating loop (observed: 9 reloads,
+                        // every one on rn=1, while 21 other pumps returned media just fine).
+                        //
+                        // Record it and keep pumping. Only the emptyPumps backstop below may decide
+                        // the session is genuinely dead, and that requires sustained absence of
+                        // media rather than a single advisory frame.
+                        reloadAdvised = true;
+                        SpiderDebug.log("YouTube SABR 收到重载建议(继续拉流): rn=" + requestCount);
                     } else if (part.id == YTSabr.SABR_CONTEXT_UPDATE) {
                         // SabrContextUpdate: type=1, scope=2, value=3, send_by_default=4
                         Long ctxType = YTProto.getInt(part.data, 1);
@@ -1377,9 +1423,14 @@ class YTSabrSession {
             // seeking can produce a few more while the server repositions. Counting those as
             // failures would force a needless re-extract on every normal startup.
             if (completed == 0) {
-                if (++emptyPumps >= 24) {
+                // Require BOTH a long empty streak and the server's advisory, and never fire while
+                // the session already holds media. A single advisory frame is normal; an advisory
+                // plus 24 consecutive media-free pumps is the signature of the genuinely dead
+                // session this backstop exists for (that case showed 197 empty pumps in a row).
+                if (++emptyPumps >= 24 && reloadAdvised && !mediaSeen) {
                     reloadRequested = true;
-                    SpiderDebug.log("YouTube SABR 连续空响应, 需重新提取: emptyPumps=" + emptyPumps);
+                    SpiderDebug.log("YouTube SABR 连续空响应且服务端建议重载, 需重新提取: emptyPumps="
+                            + emptyPumps);
                     throw new ReloadRequired("SABR produced no media for " + emptyPumps + " pumps");
                 }
             } else {
