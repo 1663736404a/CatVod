@@ -1080,13 +1080,13 @@ final class YTPlay {
         String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
         YTSabrSession bSession = session(stateKey);
         bSession.touch();
-        bSession.startProducer(data.videoItem, data.audioItem, durationMs);
-        // The producer owns SABR I/O. Snapshot only what is already indexed; later media requests
-        // continue using the producer's real MEDIA_HEADER time/native-sequence index.
-        // Do not fetch a direct URL/index on the MPD request thread. B's only source of truth is
-        // the SABR producer's MEDIA_HEADER index; the producer will extend it while playback runs.
-        List<YTFormat.Seg> videoReal = bSession.snapshotTimeline(data.videoItem.itag);
-        List<YTFormat.Seg> audioReal = bSession.snapshotTimeline(data.audioItem.itag);
+        // SABR-B is request-driven: do not start a background warm producer from the MPD request.
+        // googlevideo/PipePipe issue each VideoPlaybackAbrRequest at the player's actual time and
+        // consume the complete MEDIA_END returned by that transaction. Starting from t=0 here is
+        // wrong for resume/seek playback and makes the first t=64s request wait behind a 4K pump.
+        // The media endpoint below calls getSegment() synchronously with its requested t= value.
+        List<YTFormat.Seg> videoReal = new ArrayList<>();
+        List<YTFormat.Seg> audioReal = new ArrayList<>();
         String videoRows = timeRows(videoReal, durationMs, sabrRequestGridMs(data.videoItem, true));
         String audioRows = timeRows(audioReal, durationMs, sabrRequestGridMs(data.audioItem, false));
         com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B MPD: vid=" + vid
@@ -1280,23 +1280,14 @@ final class YTPlay {
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
                 YTSabrSession active = session(stateKey);
-                // A segment request can arrive against a session that was just replaced (the previous
-                // one cancelled on a video switch, or reaped). A fresh session has no producer until
-                // the next manifest fetch, so start it here instead of waiting for a timeout.
-                active.startProducer(data.videoItem, data.audioItem,
-                        Math.max(1000L, data.duration * 1000L));
-                // hasMedia() only means that SOME segment exists. It does not mean the requested
-                // seek target is cached. This is especially important when playback resumes at
-                // 64s: the producer was started by the MPD request at t=0, while Exo immediately
-                // asks for t=64s. The old warm-session 12s deadline returned 503 during a healthy
-                // 4K pump (measured 6-18s), which Exo surfaced as "connection timeout".
-                // Target-time requests therefore always get the cold/seek deadline. The endpoint
-                // must wait for the producer to reposition and publish a complete MEDIA_END segment.
-                long deadline = "init".equals(requested) ? 12000L : 30000L;
-                SpiderDebug.log("YouTube SABR-B 等待目标: track=" + track + ", segment=" + requested
-                        + ", deadlineMs=" + deadline + ", hasMedia=" + active.hasMedia());
+                // Do not wait for a background producer. Fetch this exact player request directly,
+                // using getSegment()'s SABR request/UMP loop. This mirrors googlevideo's
+                // request-driven stream and PipePipe's requestOnce(): the requested t= value is
+                // immediately encoded as player_time_ms, so resume and seek do not queue behind t=0.
+                SpiderDebug.log("YouTube SABR-B 直接请求目标: track=" + track + ", segment=" + requested
+                        + ", hasMedia=" + active.hasMedia());
                 YTSabrSession.Found found = active
-                        .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, deadline);
+                        .getSegment(data.videoItem, data.audioItem, track, requested);
                 if (found == null || found.media == null || found.media.length == 0) {
                     return text(503, "SABR-B 未产生目标时间媒体");
                 }
