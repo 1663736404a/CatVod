@@ -45,6 +45,9 @@ final class YTPlay {
     private final Map<String, PlayData> playCache = new HashMap<>();
     private final Map<String, SabrData> sabrCache = new HashMap<>();
     private final Map<String, Long> refreshMarks = new HashMap<>();
+    // A local MPD can outlive the host's current episode during sequential playback.
+    // Include a generation in the SABR state key so a new extraction never reuses old UMP state.
+    private final Map<String, Long> sabrGenerations = new HashMap<>();
     private final Object sabrSwitchLock = new Object();
 
     YTPlay(YouTubeLite yt, Map<String, String> header, JsonObject ext, String siteKey) {
@@ -642,7 +645,15 @@ final class YTPlay {
     private SabrData activate(String vid, SabrData data, int index, String cacheKey) {
         if (index < 0 || index >= data.candidates.size()) return null;
         Candidate selected = data.candidates.get(index);
-        String stateKey = vid + ":sabr:" + selected.client + ":" + selected.video.itag + ":" + selected.audio.itag;
+        String generationKey = (cacheKey == null ? "yt_sabr_" + vid : cacheKey);
+        long generation;
+        synchronized (sabrGenerations) {
+            generation = sabrGenerations.containsKey(generationKey)
+                    ? sabrGenerations.get(generationKey) + 1L : 1L;
+            sabrGenerations.put(generationKey, generation);
+        }
+        String stateKey = vid + ":sabr:" + generation + ":" + selected.client + ":"
+                + selected.video.itag + ":" + selected.audio.itag;
         synchronized (yt.sabrState) {
             yt.sabrState.remove(stateKey);
         }
@@ -700,16 +711,28 @@ final class YTPlay {
         SabrData data = sabrCache.get(cacheKey);
         // An MPD URL can outlive its session-bound SABR cache. Never publish a manifest backed by
         // expired play data; rebuild it from a fresh player response instead.
-        if (data != null && data.expires <= System.currentTimeMillis()) data = null;
+        if (data != null && data.expires <= System.currentTimeMillis()) {
+            sabrCache.remove(cacheKey);
+            data = null;
+        }
         if (data == null && rebuild) {
             try {
                 YouTubeLite.Extracted extracted = yt.extract(vid, true);
                 data = newSabrData(vid, extracted, quality, cacheKey);
-            } catch (Throwable ignored) {
-                // Fall through to the caller's not-found response.
+            } catch (Throwable e) {
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR extraction failed: vid="
+                        + vid + ", error=" + String.valueOf(e));
             }
         }
         return data;
+    }
+
+    private void resetSabr(String vid, String cacheKey) {
+        SabrData old = sabrCache.remove(cacheKey);
+        if (old == null || old.stateKey == null) return;
+        synchronized (yt.sabrState) {
+            yt.sabrState.remove(old.stateKey);
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -780,8 +803,9 @@ final class YTPlay {
      */
     private Object[] proxySabrMpd2(Map<String, String> params) {
         String vid = params.get("vid");
-        String cacheKey = "yt_sabr_" + vid;
-        SabrData data = vid == null ? null : sabrData(vid, "best", cacheKey, true);
+        String quality = params.get("quality") == null ? "best" : params.get("quality");
+        String cacheKey = "best".equals(quality) ? "yt_sabr_" + vid : "yt_sabr_" + vid + "_" + quality;
+        SabrData data = vid == null ? null : sabrData(vid, quality, cacheKey, true);
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
         YTFormat video = data.videoItem;
         YTFormat audio = data.audioItem;
@@ -946,6 +970,7 @@ final class YTPlay {
         boolean init = "init".equals(segment);
         int attempts = 1 + (init ? data.candidates.size() : 0);
         String lastError = null;
+        boolean rebuilt = false;
         for (int attempt = 0; attempt < attempts; attempt++) {
             SabrData current = sabrCache.get(cacheKey);
             if (current != null) data = current;
@@ -976,6 +1001,20 @@ final class YTPlay {
                         + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
                         + ", error=" + lastError);
                 boolean canFailover = init && lastError.contains("SABR HTTP 4");
+                // A stale MPD/session pair is common when the host advances to the next episode
+                // or seeks while parallel init requests are still in flight. Rebuild once for A
+                // before returning an HTTP 500 that makes the host leave the detail page.
+                if (init && !rebuilt && (lastError.contains("IllegalArgumentException")
+                        || lastError.contains("empty") || lastError.contains("SABR"))) {
+                    rebuilt = true;
+                    resetSabr(vid, cacheKey);
+                    SabrData fresh = sabrData(vid, quality, cacheKey, true);
+                    if (fresh != null) {
+                        data = fresh;
+                        attempts = Math.max(attempts, 1 + fresh.candidates.size());
+                        continue;
+                    }
+                }
                 if (!canFailover || switchClient(vid, requestIndex, cacheKey) == null) break;
             }
         }
