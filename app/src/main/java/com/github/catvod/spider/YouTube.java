@@ -187,18 +187,23 @@ public class YouTube extends Spider {
         // YouTube playback is SABR-only here. Keep A (the experimental SegmentTemplate bridge)
         // and B (the SegmentBase bridge) as explicit choices; do not mix direct URLs into this menu.
         List<String> urls = new ArrayList<>();
-        // Manifest URLs must come from the JAR-owned media server for the same reason its segment
-        // URLs do: after the host clears its jar-loader registry the proxy:// scheme resolves to a
-        // handler that no longer reaches this JAR, so a re-prepare (decoder fallback, seek, retry)
-        // gets HTTP 500 instead of the manifest and the player reports a fatal source error.
+        // The top-level manifest URL deliberately stays on the host's proxy:// scheme. Handing the
+        // host a raw http://127.0.0.1 URL makes it classify playback as EXTERNAL_LOOPBACK_PROXY
+        // ("evidence=unregistered-loopback-port") and run a blocking readiness probe before every
+        // prepare, which cannot succeed for a port the host does not own: observed 25 attempts /
+        // 5067ms of dead time on each attempt. proxy:// is classified as route=OTHER with no gate.
+        //
+        // Segment URLs inside the manifest are a different matter and do use the JAR-owned server
+        // (see YTPlay.localUrl): they are what must survive the host's jar-loader clear, and they
+        // are fetched by the player directly without going through that readiness gate.
         String aParams = "&type=sabr_mpd&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
         String bParams = "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
         urls.add("sabr•A");
-        urls.add(play.manifestUrl(aParams));
+        urls.add(Proxy.getUrl(siteKey, aParams));
         urls.add("sabr•B");
-        urls.add(play.manifestUrl(bParams));
+        urls.add(Proxy.getUrl(siteKey, bParams));
         return Result.get().url(urls).dash().string();
     }
 

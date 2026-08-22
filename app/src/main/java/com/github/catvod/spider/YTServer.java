@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
@@ -47,6 +48,8 @@ final class YTServer {
     private static ServerSocket socket;
     private static ExecutorService workers;
     private static int port;
+    /** Backs off after a failed bind so each segment request does not re-probe. */
+    private static long retryAfter;
 
     private YTServer() {
     }
@@ -85,34 +88,88 @@ final class YTServer {
     /** Returns the live port, starting the server on first use. {@code 0} means unavailable. */
     static synchronized int ensure() {
         if (socket != null && !socket.isClosed()) return port;
+        if (System.currentTimeMillis() < retryAfter) return 0;
+        ServerSocket opened = null;
         try {
-            // Port 0 lets the OS pick a free one. A previous incarnation of this JAR (loaded by an
-            // older class loader) may still be serving an in-flight session on its own port, so we
-            // must never insist on a fixed number.
-            ServerSocket opened = new ServerSocket(0, 32, InetAddress.getLoopbackAddress());
+            // Bind the IPv4 literal explicitly. InetAddress.getLoopbackAddress() can resolve to the
+            // IPv6 loopback (::1), and a socket bound to ::1 does NOT accept connections addressed
+            // to 127.0.0.1 — bind() still succeeds and getLocalPort() still reports a port, so the
+            // server looks healthy while every client connect is refused instantly. That is exactly
+            // what happened: 64 ConnectExceptions in 2-9ms, zero accepted connections.
+            //
+            // Port 0 lets the OS pick a free one: a previous incarnation of this JAR (older class
+            // loader) may still be serving an in-flight session, so never insist on a fixed number.
+            opened = new ServerSocket();
             opened.setReuseAddress(true);
-            socket = opened;
-            port = opened.getLocalPort();
-            workers = Executors.newCachedThreadPool(runnable -> {
+            opened.bind(new InetSocketAddress(ipv4Loopback(), 0), 32);
+            int candidate = opened.getLocalPort();
+            ExecutorService pool = Executors.newCachedThreadPool(runnable -> {
                 Thread thread = new Thread(runnable, "youtube-media-worker");
                 thread.setDaemon(true);
                 return thread;
             });
-            LAST_REQUEST.set(System.currentTimeMillis());
-            Thread accept = new Thread(() -> acceptLoop(opened), "youtube-media-server");
+            final ServerSocket server = opened;
+            Thread accept = new Thread(() -> acceptLoop(server), "youtube-media-server");
             accept.setDaemon(true);
             accept.start();
-            Thread idle = new Thread(() -> idleLoop(opened), "youtube-media-idle");
+
+            // Never hand the player a URL we have not proven reachable. Without this check a bad
+            // bind takes playback down completely; with it, the worst case is a fallback to the
+            // host proxy, i.e. the old behaviour.
+            if (!reachable(candidate)) {
+                throw new IOException("loopback self-test failed on port " + candidate);
+            }
+            socket = opened;
+            port = candidate;
+            workers = pool;
+            LAST_REQUEST.set(System.currentTimeMillis());
+            Thread idle = new Thread(() -> idleLoop(server), "youtube-media-idle");
             idle.setDaemon(true);
             idle.start();
-            SpiderDebug.log("YouTube 媒体服务已启动: port=" + port);
+            SpiderDebug.log("YouTube 媒体服务已启动: port=" + port
+                    + ", bind=" + opened.getInetAddress().getHostAddress());
             return port;
         } catch (Throwable e) {
-            SpiderDebug.log("YouTube 媒体服务启动失败: " + String.valueOf(e));
+            SpiderDebug.log("YouTube 媒体服务启动失败, 回退宿主代理: " + String.valueOf(e));
+            if (opened != null) {
+                try {
+                    opened.close();
+                } catch (Throwable ignored) {
+                }
+            }
             socket = null;
             port = 0;
+            // Do not re-probe on every segment request; a failing bind would add latency to each.
+            retryAfter = System.currentTimeMillis() + 60000L;
             return 0;
         }
+    }
+
+    /** IPv4 loopback as a literal, bypassing name resolution and IPv6 preference entirely. */
+    private static InetAddress ipv4Loopback() throws IOException {
+        return InetAddress.getByAddress(new byte[]{127, 0, 0, 1});
+    }
+
+    /** Verifies the freshly bound port actually accepts a connection on 127.0.0.1. */
+    private static boolean reachable(int candidate) {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            Socket probe = new Socket();
+            try {
+                probe.connect(new InetSocketAddress(ipv4Loopback(), candidate), 1500);
+                return true;
+            } catch (Throwable e) {
+                try {
+                    Thread.sleep(100L);
+                } catch (InterruptedException ignored) {
+                }
+            } finally {
+                try {
+                    probe.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return false;
     }
 
     /** Absolute URL for one media request, or {@code null} when the server is unavailable. */

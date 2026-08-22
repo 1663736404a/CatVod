@@ -195,16 +195,6 @@ final class YTPlay {
         return Proxy.getUrl() + "?do=csp&siteKey=" + siteKey + params;
     }
 
-    /**
-     * Top-level manifest URL handed to the player. Falls back to the host's {@code proxy://}
-     * scheme only when this JAR's own server could not be opened.
-     */
-    String manifestUrl(String params) {
-        String owned = YTServer.url(ownerId, siteKey, params);
-        if (owned != null) return owned;
-        return Proxy.getUrl(siteKey, params);
-    }
-
     private static String sabrCacheKey(String vid, String quality, String sid, boolean b) {
         String key = (b ? "yt_sabr_b_" : "yt_sabr_") + vid;
         if (!"best".equals(quality)) key += "_" + quality;
