@@ -207,10 +207,17 @@ final class YTHttp {
         merged.put("Accept-Encoding", "identity");
         if (headers != null) merged.putAll(headers);
         Request request = request(target, merged).post(RequestBody.create(payload, PROTOBUF)).build();
-        // Bound a single SABR call so a player that has already been released cannot leave an
-        // OkHttp worker waiting indefinitely on a dead CDN stream.
-        OkHttpClient active = client.newBuilder().callTimeout(8, TimeUnit.SECONDS).build();
-        Response response = active.newCall(request).execute();
+        // Deliberately no callTimeout. callTimeout bounds the WHOLE call including streaming the UMP
+        // body, so an 8s deadline aborted perfectly healthy responses as soon as one pump returned
+        // several large segments at once (observed: completed=5 at 2160p, then
+        // InterruptedIOException every ~8.1s, 15 times in one session). Seeking into a video with a
+        // resume position made it worse, because the producer has to refetch init plus a burst of
+        // segments from the seek point.
+        //
+        // Liveness is still bounded, just not by a deadline on bulk transfer: connectTimeout and
+        // readTimeout (set on the shared client) catch a dead or stalled socket, and the session's
+        // canceled flag is checked inside the UMP parse loop so teardown abandons the response.
+        Response response = client.newCall(request).execute();
         Result result = new Result();
         result.raw = response;
         result.code = response.code();

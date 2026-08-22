@@ -76,7 +76,18 @@ class YTSabrSession {
     private long producerDurationMs;
     /** Stop prefetching this long after the last real segment request from the player. */
     private static final long CONSUMER_IDLE_MS = 20000L;
+    /**
+     * Grace period before the first segment request ever arrives. Startup legitimately has no
+     * segment traffic for a long stretch: the player parses the MPD, negotiates a decoder and may
+     * fall back from hardware to software (observed ~15s). Judging idleness by segment requests
+     * alone dropped a freshly filled 34MiB cache mid-startup, forcing a refetch loop.
+     */
+    private static final long STARTUP_GRACE_MS = 45000L;
     private volatile long lastConsumerAt;
+    /** Any player-facing activity, including manifest requests. Keeps startup from looking idle. */
+    private volatile long lastTouchAt;
+    /** True once the player has actually asked for a segment. */
+    private volatile boolean consumerSeen;
 
     private byte[] playbackCookie;
     private String url;
@@ -116,17 +127,41 @@ class YTSabrSession {
         return lastStatus;
     }
 
-    /**
-     * True when no consumer has requested a segment for well past the producer's idle window, so the
-     * session is safe to reap. Used to bound the static session map without touching live playback.
-     */
     boolean isCanceled() {
         return canceled;
     }
 
+    /**
+     * Marks any player-facing activity for this session, including manifest requests.
+     *
+     * <p>Separate from {@link #lastConsumerAt} on purpose: a manifest fetch proves the player is
+     * still working on this video even though it has not asked for a segment yet, which is exactly
+     * the startup window where the idle check used to misfire.
+     */
+    void touch() {
+        lastTouchAt = System.currentTimeMillis();
+    }
+
+    /** True when the producer should stop prefetching and release its media cache. */
+    private boolean shouldIdleExit() {
+        long now = System.currentTimeMillis();
+        if (!consumerSeen) {
+            // Nothing has been requested yet. Only give up once the whole startup window has
+            // elapsed with no activity at all, so MPD parsing and decoder fallback do not count
+            // as idleness.
+            long since = now - Math.max(lastTouchAt, lastConsumerAt);
+            return lastTouchAt > 0 && since > STARTUP_GRACE_MS;
+        }
+        return lastConsumerAt > 0 && now - Math.max(lastConsumerAt, lastTouchAt) > CONSUMER_IDLE_MS;
+    }
+
+    /**
+     * True when nothing has touched this session for well past the producer's idle window, so it is
+     * safe to reap. Bounds the static session map without disturbing live playback.
+     */
     boolean isIdle() {
         if (canceled) return true;
-        long last = lastConsumerAt;
+        long last = Math.max(lastConsumerAt, lastTouchAt);
         if (last <= 0) return false;
         return System.currentTimeMillis() - last > CONSUMER_IDLE_MS * 3;
     }
@@ -182,12 +217,18 @@ class YTSabrSession {
             producerVideoItem = videoItem;
             producerAudioItem = audioItem;
             producerDurationMs = Math.max(0L, durationMs);
-            lastConsumerAt = System.currentTimeMillis();
+            // startProducer runs from the MPD request, before any segment is asked for. Count it as
+            // a touch rather than a consumer hit so the startup grace period applies.
+            lastTouchAt = System.currentTimeMillis();
             if (producerThread != null && producerThread.isAlive()) {
                 producerMonitor.notifyAll();
                 return;
             }
-            canceled = false;
+            // Never un-cancel. A cancelled session has already released its media cache and is
+            // being discarded by its owner; resurrecting it here would restart a producer for a
+            // video nobody is watching, which is the leak cancelOtherVideos() exists to stop.
+            // Callers get a fresh session from YTPlay.session() instead.
+            if (canceled) return;
             producerThread = new Thread(() -> producerLoop(), "youtube-sabr-b-producer");
             producerThread.setDaemon(true);
             producerThread.start();
@@ -227,6 +268,8 @@ class YTSabrSession {
                                String segment, long timeoutMs) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
         lastConsumerAt = System.currentTimeMillis();
+        lastTouchAt = lastConsumerAt;
+        consumerSeen = true;
         reviveProducer();
         boolean init = "init".equals(segment);
         long targetMs = 0L;
@@ -312,9 +355,11 @@ class YTSabrSession {
             // producer used to keep pulling 2160p segments long after the player was gone
             // (observed: 31s past activity destroy, plus a second concurrent session on the same
             // video). This bounds wasted traffic to the idle window regardless of teardown.
-            long idleMs = System.currentTimeMillis() - lastConsumerAt;
-            if (lastConsumerAt > 0 && idleMs > CONSUMER_IDLE_MS) {
-                SpiderDebug.log("YouTube SABR-B producer 空闲退出: idleMs=" + idleMs);
+            if (shouldIdleExit()) {
+                long idleMs = System.currentTimeMillis()
+                        - Math.max(lastConsumerAt, lastTouchAt);
+                SpiderDebug.log("YouTube SABR-B producer 空闲退出: idleMs=" + idleMs
+                        + ", consumerSeen=" + consumerSeen);
                 // Keep the negotiated protocol state (cookie, rn, url) so a resumed player can be
                 // adopted cheaply, but let go of the media bytes: an idle 2160p cache is the single
                 // largest avoidable contributor to the heap pressure that gets the host reclaimed.
@@ -386,6 +431,8 @@ class YTSabrSession {
     Found getSegment(YTFormat videoItem, YTFormat audioItem, String track, String segment) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
         lastConsumerAt = System.currentTimeMillis();
+        lastTouchAt = lastConsumerAt;
+        consumerSeen = true;
         YTSabr.Config cfg = videoItem != null && videoItem.sabrConfig != null
                 ? videoItem.sabrConfig
                 : audioItem != null ? audioItem.sabrConfig : null;
