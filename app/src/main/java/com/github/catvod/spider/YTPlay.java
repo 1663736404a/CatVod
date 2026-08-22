@@ -853,8 +853,12 @@ final class YTPlay {
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
         long durationMs = Math.max(1000L, data.duration * 1000L);
         String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
-        List<YTFormat.Seg> videoReal = warmSabrTimeline(data, stateKey, "video");
-        List<YTFormat.Seg> audioReal = warmSabrTimeline(data, stateKey, "audio");
+        YTSabrSession bSession = session(stateKey);
+        bSession.startProducer(data.videoItem, data.audioItem, durationMs);
+        // The producer owns SABR I/O. Snapshot only what is already indexed; later media requests
+        // continue using the producer's real MEDIA_HEADER time/native-sequence index.
+        List<YTFormat.Seg> videoReal = bSession.snapshotTimeline(data.videoItem.itag);
+        List<YTFormat.Seg> audioReal = bSession.snapshotTimeline(data.audioItem.itag);
         String videoRows = timeRows(videoReal, durationMs, sabrRequestGridMs(data.videoItem, true));
         String audioRows = timeRows(audioReal, durationMs, sabrRequestGridMs(data.audioItem, false));
         com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B MPD: vid=" + vid
@@ -1044,11 +1048,8 @@ final class YTPlay {
             }
         }
         try {
-            YTSabrSession.Found found = null;
-            for (int attempt = 0; attempt < 2; attempt++) {
-                found = session(stateKey).getSegment(data.videoItem, data.audioItem, track, requested);
-                if (found != null && found.media != null && found.media.length > 0) break;
-            }
+            YTSabrSession.Found found = session(stateKey)
+                    .awaitProducedSegment(data.videoItem, data.audioItem, track, requested, 7000L);
             if (found == null || found.media == null || found.media.length == 0) {
                 return text(503, "SABR-B 未产生目标时间媒体");
             }

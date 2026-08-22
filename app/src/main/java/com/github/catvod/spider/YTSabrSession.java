@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -67,6 +68,12 @@ class YTSabrSession {
 
     final ReentrantLock lock = new ReentrantLock(true);
     private volatile boolean canceled;
+    private final Object producerMonitor = new Object();
+    private Thread producerThread;
+    private YTFormat producerVideoItem;
+    private YTFormat producerAudioItem;
+    private long producerTargetMs;
+    private long producerDurationMs;
 
     private byte[] playbackCookie;
     private String url;
@@ -119,6 +126,135 @@ class YTSabrSession {
 
     long requestCount() {
         return requestCount;
+    }
+
+    /** Starts one background producer for B's real-time index and media cache. */
+    void startProducer(YTFormat videoItem, YTFormat audioItem, long durationMs) {
+        synchronized (producerMonitor) {
+            producerVideoItem = videoItem;
+            producerAudioItem = audioItem;
+            producerDurationMs = Math.max(0L, durationMs);
+            if (producerThread != null && producerThread.isAlive()) {
+                producerMonitor.notifyAll();
+                return;
+            }
+            canceled = false;
+            producerThread = new Thread(() -> producerLoop(), "youtube-sabr-b-producer");
+            producerThread.setDaemon(true);
+            producerThread.start();
+        }
+    }
+
+    /**
+     * Returns a real cached segment, waiting only for the background producer to index it.
+     * This method never performs SABR network I/O on the player's HTTP request thread.
+     */
+    Found awaitProducedSegment(YTFormat videoItem, YTFormat audioItem, String track,
+                               String segment, long timeoutMs) throws Exception {
+        if (canceled) throw new IOException("Canceled: SABR session closed");
+        boolean init = "init".equals(segment);
+        long targetMs = 0L;
+        if (!init) {
+            if (segment == null || !segment.startsWith("t=")) {
+                Found bad = new Found();
+                bad.error = "invalid producer time segment";
+                return bad;
+            }
+            targetMs = Math.max(0L, (long) Double.parseDouble(segment.substring(2)));
+        }
+        boolean rewind = false;
+        synchronized (producerMonitor) {
+            if (!init) {
+                rewind = targetMs + 15000L < producerTargetMs;
+                producerTargetMs = rewind ? targetMs : Math.max(producerTargetMs, targetMs);
+            }
+            producerMonitor.notifyAll();
+        }
+        if (rewind) {
+            lock.lock();
+            try {
+                if (!canceled) {
+                    playbackCookie = null;
+                    seek(targetMs);
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+        long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
+        while (!canceled && System.currentTimeMillis() < deadline) {
+            lock.lock();
+            try {
+                Integer itag = "video".equals(track)
+                        ? (videoItem == null ? null : videoItem.itag)
+                        : (audioItem == null ? null : audioItem.itag);
+                Found found = init ? initLookup(itag) : findSegmentAtTime(itag, targetMs);
+                if (found != null && found.media != null && found.media.length > 0) {
+                    found.targetMs = targetMs;
+                    found.requestCount = requestCount;
+                    return found;
+                }
+            } finally {
+                lock.unlock();
+            }
+            synchronized (producerMonitor) {
+                if (!canceled) producerMonitor.wait(Math.min(200L,
+                        Math.max(1L, deadline - System.currentTimeMillis())));
+            }
+        }
+        Found timeout = new Found();
+        timeout.error = canceled ? "producer canceled" : "producer target timeout";
+        timeout.targetMs = targetMs;
+        return timeout;
+    }
+
+    private void producerLoop() {
+        while (!canceled) {
+            YTFormat videoItem;
+            YTFormat audioItem;
+            long goal;
+            boolean covered = false;
+            boolean locked = false;
+            synchronized (producerMonitor) {
+                videoItem = producerVideoItem;
+                audioItem = producerAudioItem;
+                long target = producerTargetMs;
+                goal = producerDurationMs > 0
+                        ? Math.min(producerDurationMs, target + 30000L) : target + 30000L;
+            }
+            if (videoItem == null || audioItem == null) return;
+            try {
+                if (!lock.tryLock(250L, TimeUnit.MILLISECONDS)) continue;
+                locked = true;
+                if (canceled) return;
+                covered = cacheCovers(videoItem.itag, goal) && cacheCovers(audioItem.itag, goal);
+                if (!covered) {
+                    YTSabr.Config cfg = videoItem.sabrConfig != null
+                            ? videoItem.sabrConfig : audioItem.sabrConfig;
+                    pumpOnce(cfg, videoItem, audioItem);
+                }
+            } catch (Throwable error) {
+                if (canceled) return;
+                SpiderDebug.log("YouTube SABR-B producer: " + String.valueOf(error));
+                try {
+                    Thread.sleep(120L);
+                } catch (InterruptedException ignored) {
+                    if (canceled) return;
+                }
+            } finally {
+                if (locked) lock.unlock();
+            }
+            synchronized (producerMonitor) {
+                producerMonitor.notifyAll();
+                if (covered && !canceled) {
+                    try {
+                        producerMonitor.wait(120L);
+                    } catch (InterruptedException ignored) {
+                        if (canceled) return;
+                    }
+                }
+            }
+        }
     }
 
     /* ------------------------------------------------------------------ */
