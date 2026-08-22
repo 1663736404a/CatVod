@@ -684,7 +684,22 @@ class YTSabrSession {
      * another request later extends the cache.
      */
     List<YTFormat.Seg> snapshotTimeline(Integer targetItag) {
-        lock.lock();
+        // Never block the manifest thread on the session lock. The producer holds it for the whole
+        // duration of one SABR pump, which was measured at 6-18s on 2160p, so an unbounded lock()
+        // here stalled the MPD response until the player gave up after 15s and reported a socket
+        // failure. The timeline is only a request-grid hint: returning an empty snapshot makes
+        // timeRows() fall back to the even grid, and the next manifest refresh picks up the real
+        // boundaries once the producer is between pumps.
+        boolean held = false;
+        try {
+            held = lock.tryLock(250L, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        if (!held) {
+            SpiderDebug.log("YouTube SABR 时间轴快照跳过(producer 持锁): itag=" + targetItag);
+            return new ArrayList<>();
+        }
         try {
             Map<Integer, byte[]> media = segments.get(targetItag);
             Map<Integer, Meta> metas = segmentMeta.get(targetItag);
@@ -1352,12 +1367,17 @@ class YTSabrSession {
             SpiderDebug.log("YouTube SABR 处理完成: rn=" + requestCount + ", completed=" + completed
                     + ", initialized=" + initialized.size() + ", videoCached=" + initSegments.containsKey(videoItag)
                     + ", audioCached=" + initSegments.containsKey(audioItag));
-            // Circuit breaker. A server that keeps answering 200 with only control parts will never
-            // start serving media on its own, and retrying forever just burns requests while the
-            // player sits at zero buffer (observed: 197 pumps, all completed=0). Treat a long empty
-            // streak as "this session is dead" so the caller re-extracts instead of spinning.
+            // Circuit breaker for a server that keeps answering 200 with only control parts and will
+            // never start serving media (observed: 197 pumps, all completed=0, while the player sat
+            // at zero buffer). The primary signal is RELOAD_PLAYER_RESPONSE above; this is only a
+            // backstop for variants that do not send it.
+            //
+            // The threshold is deliberately high: the FIRST pump of a healthy session legitimately
+            // returns no media (it establishes the stream, and rn=2 then delivers completed=4), and
+            // seeking can produce a few more while the server repositions. Counting those as
+            // failures would force a needless re-extract on every normal startup.
             if (completed == 0) {
-                if (++emptyPumps >= 8) {
+                if (++emptyPumps >= 24) {
                     reloadRequested = true;
                     SpiderDebug.log("YouTube SABR 连续空响应, 需重新提取: emptyPumps=" + emptyPumps);
                     throw new ReloadRequired("SABR produced no media for " + emptyPumps + " pumps");
