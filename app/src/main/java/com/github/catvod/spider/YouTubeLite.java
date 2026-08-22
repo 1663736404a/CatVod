@@ -87,6 +87,7 @@ class YouTubeLite {
     private static class CacheEntry {
         Extracted data;
         long expires;
+        long createdAt;
     }
 
     private final YTHttp http;
@@ -96,6 +97,7 @@ class YouTubeLite {
     private final Map<String, String> playerCache = new HashMap<>();
     private final Map<String, Extracted> extractCacheData = new HashMap<>();
     private final Map<String, CacheEntry> extractCache = new HashMap<>();
+    private final Map<String, Object> extractLocks = new HashMap<>();
     private final Map<String, List<String[]>> sigPlanCache = new HashMap<>();
     private final long extractCacheTtl;
 
@@ -128,9 +130,32 @@ class YouTubeLite {
 
     Extracted extract(String urlOrId, boolean forceRefresh) throws Exception {
         String videoId = extractVideoId(urlOrId);
+        Object lock;
+        synchronized (extractLocks) {
+            lock = extractLocks.get(videoId);
+            if (lock == null) {
+                lock = new Object();
+                extractLocks.put(videoId, lock);
+            }
+        }
+        synchronized (lock) {
+            return extractLocked(videoId, forceRefresh);
+        }
+    }
+
+    private Extracted extractLocked(String videoId, boolean forceRefresh) throws Exception {
+        return extractLocked(videoId, forceRefresh, true);
+    }
+
+    private Extracted extractLocked(String videoId, boolean forceRefresh, boolean retryToken) throws Exception {
         CacheEntry cached = extractCache.get(videoId);
         long now = System.currentTimeMillis();
-        if (!forceRefresh && cached != null && cached.expires > now) return cached.data;
+        if (cached != null && cached.expires > now) {
+            // A forced refresh from parallel A/B MPD requests may arrive while another caller has
+            // already produced a valid session. Reuse that session instead of starting another
+            // BotGuard/WebView cycle. Empty SABR results are deliberately not cached below.
+            if (!forceRefresh || (cached.data != null && !cached.data.sabrFormats.isEmpty())) return cached.data;
+        }
 
         String watchUrl = "https://www.youtube.com/watch?v=" + videoId;
         String page = http.string(watchUrl);
@@ -222,11 +247,23 @@ class YouTubeLite {
         result.dashUrl = dashUrl;
         result.playerUrl = playerUrl;
         extractFormats(responses, playerUrl, result);
+        if (result.sabrFormats.isEmpty() && retryToken && visitorData != null) {
+            // BotGuard/WebView can time out once while the visitor binding is still valid. Retry
+            // the same serialized extraction once with a fresh token before exposing formats=0.
+            SpiderDebug.log("YouTube TVHTML5 SABR 为空，重试 visitor-bound poToken: vid=" + videoId);
+            session.retryToken();
+            return extractLocked(videoId, true, false);
+        }
 
-        CacheEntry entry = new CacheEntry();
-        entry.data = result;
-        entry.expires = System.currentTimeMillis() + extractCacheTtl * 1000;
-        extractCache.put(videoId, entry);
+        // Do not cache a transient BotGuard timeout as a valid extraction. A later A/B request
+        // should be able to retry with a fresh visitor-bound token instead of returning formats=0.
+        if (!result.sabrFormats.isEmpty() || !result.formats.isEmpty()) {
+            CacheEntry entry = new CacheEntry();
+            entry.data = result;
+            entry.createdAt = System.currentTimeMillis();
+            entry.expires = entry.createdAt + extractCacheTtl * 1000;
+            extractCache.put(videoId, entry);
+        }
         return result;
     }
 
