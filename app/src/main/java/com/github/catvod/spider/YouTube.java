@@ -9,6 +9,7 @@ import com.github.catvod.bean.Filter;
 import com.github.catvod.bean.Result;
 import com.github.catvod.bean.Vod;
 import com.github.catvod.crawler.Spider;
+import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Json;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
@@ -44,6 +45,8 @@ public class YouTube extends Spider {
     private YoutubeSession session;
     private YoutubeProxy youtubeProxy;
     private String proxyStr;
+    /** Whether {@code vod_pic} is rewritten through this spider; see {@link YTImage}. */
+    private boolean proxyImage;
     private JsonObject externalCatalog;
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
@@ -71,6 +74,7 @@ public class YouTube extends Spider {
         header.put("Referer", "https://www.youtube.com/");
         this.proxyStr = readProxy();
         this.http = new YTHttp(header, proxyStr);
+        this.proxyImage = readProxyImage();
         this.externalCatalog = readCatalog();
         this.yt = new YouTubeLite(context, http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
@@ -94,40 +98,95 @@ public class YouTube extends Spider {
     }
 
     /**
-     * Reads an explicit proxy, otherwise uses a listening common local HTTP/Mixed proxy.
-     * Clash, Hiddify and the two known local proxy services are covered by default.
+     * Reads the proxy from {@code ext.proxy}. Nothing is guessed.
+     *
+     * <p>Port probing was removed deliberately. Guessing from a candidate list picked whichever
+     * port happened to be listening, which is not necessarily the one the user selected: a device
+     * can have several local proxies up at once (a client's mixed port, a per-node port, another
+     * JAR's downloader) and the probe cannot tell which one carries the node the user chose. It
+     * also made the effective route invisible — nothing in the config said where traffic went.
+     * The proxy is now configuration, so it is explicit, stable across restarts, and reviewable.
+     *
+     * <p>Accepted forms, all equivalent:
+     * <pre>
+     * "proxy": "127.0.0.1:10172"
+     * "proxy": "http://127.0.0.1:10172"
+     * "proxy": {"http": "127.0.0.1:10172"}
+     * "proxy": {"host": "127.0.0.1", "port": 10172}
+     * </pre>
+     *
+     * @return {@code host:port}, or {@code null} for a direct connection.
      */
     private String readProxy() {
+        String text = normalizeProxy(rawProxy());
+        if (text.isEmpty()) {
+            SpiderDebug.log("YouTube 未配置代理: 直连。需要代理请在 ext 写 \"proxy\": \"127.0.0.1:端口\"");
+            return null;
+        }
+        if (!validProxy(text)) {
+            SpiderDebug.log("YouTube 代理配置无效，已按直连处理: " + text + "（应为 host:port）");
+            return null;
+        }
+        SpiderDebug.log("YouTube 使用配置代理: " + text);
+        return text;
+    }
+
+    /** Pulls the raw {@code ext.proxy} value in any of its accepted shapes. */
+    private String rawProxy() {
         JsonElement value = ext.get("proxy");
-        if (value != null && !value.isJsonNull()) {
-            String text = "";
-            if (value.isJsonPrimitive()) {
-                text = value.getAsString();
-            } else if (value.isJsonObject()) {
-                JsonObject obj = value.getAsJsonObject();
-                text = YouTubeLite.optString(obj, "http", YouTubeLite.optString(obj, "https", ""));
-            }
-            text = normalizeProxy(text);
-            return text.isEmpty() ? null : text;
-        }
-        for (int port : new int[]{7890, 12334, 10172, 9966}) {
-            String candidate = "127.0.0.1:" + port;
-            if (isListening(port)) {
-                com.github.catvod.crawler.SpiderDebug.log("YouTube 自动使用本机代理: " + candidate);
-                return candidate;
-            }
-        }
-        return null;
+        if (value == null || value.isJsonNull()) return "";
+        if (value.isJsonPrimitive()) return value.getAsString();
+        if (!value.isJsonObject()) return "";
+        JsonObject obj = value.getAsJsonObject();
+        String text = YouTubeLite.optString(obj, "http", YouTubeLite.optString(obj, "https", ""));
+        if (!text.isEmpty()) return text;
+        String host = YouTubeLite.optString(obj, "host", "");
+        String port = YouTubeLite.optString(obj, "port", "");
+        return host.isEmpty() || port.isEmpty() ? "" : host + ":" + port;
     }
 
     private static String normalizeProxy(String text) {
-        return text == null ? "" : text.replace("http://", "").replace("https://", "").trim();
+        if (text == null) return "";
+        String value = text.trim();
+        if (value.startsWith("http://")) value = value.substring(7);
+        else if (value.startsWith("https://")) value = value.substring(8);
+        // Tolerate a trailing slash from a pasted URL.
+        while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
+        return value.trim();
     }
 
-    private static boolean isListening(int port) {
-        try (java.net.Socket socket = new java.net.Socket()) {
-            socket.connect(new java.net.InetSocketAddress("127.0.0.1", port), 200);
-            return true;
+    /**
+     * Whether posters should be fetched through this spider instead of by the host directly.
+     *
+     * <p>Defaults to on whenever a proxy is configured: if YouTube needs a proxy to reach, its
+     * image CDN almost always does too, and the host's image loader has no proxy of its own.
+     * Override with {@code "proxy_image": false} (or {@code true} to force it while direct).
+     */
+    private boolean readProxyImage() {
+        JsonElement value = ext.get("proxy_image");
+        if (value != null && !value.isJsonNull() && value.isJsonPrimitive()) {
+            String text = value.getAsString().trim().toLowerCase();
+            boolean enabled = !("false".equals(text) || "0".equals(text) || "off".equals(text) || "no".equals(text));
+            SpiderDebug.log("YouTube 图片代理: " + (enabled ? "开启" : "关闭") + "(配置)");
+            return enabled;
+        }
+        boolean enabled = proxyStr != null;
+        SpiderDebug.log("YouTube 图片代理: " + (enabled ? "开启" : "关闭") + "(跟随代理设置)");
+        return enabled;
+    }
+
+    /** Rewrites one poster URL for delivery through this spider. */
+    private String pic(String url) {
+        return YTImage.wrap(siteKey, url, proxyImage);
+    }
+
+    /** Rejects a malformed value up front so it is reported once instead of failing every call. */
+    private static boolean validProxy(String text) {
+        int colon = text.lastIndexOf(':');
+        if (colon <= 0 || colon == text.length() - 1) return false;
+        try {
+            int port = Integer.parseInt(text.substring(colon + 1).trim());
+            return port > 0 && port <= 65535;
         } catch (Throwable ignored) {
             return false;
         }
@@ -207,7 +266,7 @@ public class YouTube extends Spider {
         Vod vod = new Vod();
         vod.setVodId(videoId);
         vod.setVodName(title);
-        vod.setVodPic(YTParse.thumbnail(videoId));
+        vod.setVodPic(pic(YTParse.thumbnail(videoId)));
         vod.setVodPlayFrom(TextUtils.join("$$$", playFrom));
         vod.setVodPlayUrl(TextUtils.join("$$$", playUrl));
         return Result.string(vod);
@@ -245,6 +304,9 @@ public class YouTube extends Spider {
 
     @Override
     public Object[] proxy(Map<String, String> params) {
+        // Thumbnails are answered here rather than in YTPlay: they are unrelated to a playback
+        // session, so a poster must still load when no video is playing.
+        if (params != null && "img".equals(params.get("type"))) return YTImage.serve(http, params);
         return youtubeProxy == null ? null : youtubeProxy.handle(params);
     }
 
@@ -391,7 +453,12 @@ public class YouTube extends Spider {
 
     private String list(List<YTParse.Item> items, int page, boolean hasMore) {
         List<Vod> list = new ArrayList<>();
-        for (YTParse.Item item : items) list.add(item.toVod());
+        // Rewrite on the item, not the Vod: Vod exposes no pic getter, so the value has to be
+        // wrapped before conversion.
+        for (YTParse.Item item : items) {
+            item.pic = pic(item.pic);
+            list.add(item.toVod());
+        }
         int count = hasMore ? page + 1 : page;
         return Result.get().vod(list).page(page, count, list.size(), list.size()).string();
     }
@@ -405,7 +472,7 @@ public class YouTube extends Spider {
         Vod vod = new Vod();
         vod.setVodId("pl:" + playlist.playlistId);
         vod.setVodName(playlist.title.isEmpty() ? playlist.playlistId : playlist.title);
-        vod.setVodPic(playlist.pic);
+        vod.setVodPic(pic(playlist.pic));
         vod.setVodRemarks(count > 0 ? count + " videos" : "YouTube播放列表");
         vod.setStyle(Vod.Style.rect(16.0f / 9.0f));
         return vod;
@@ -438,7 +505,7 @@ public class YouTube extends Spider {
         Vod vod = new Vod();
         vod.setVodId("pl:" + playlistId);
         vod.setVodName(playlist.title.isEmpty() ? playlistId : playlist.title);
-        vod.setVodPic(playlist.pic.isEmpty() ? videos.get(0).pic : playlist.pic);
+        vod.setVodPic(pic(playlist.pic.isEmpty() ? videos.get(0).pic : playlist.pic));
         vod.setVodRemarks(videos.size() + " videos");
         vod.setVodContent(TextUtils.join("\n", content));
         vod.setVodPlayFrom("YouTube自动");
