@@ -354,7 +354,7 @@ final class YTIndex {
             if (idParts[0] < 0) return -1;
             int idStart = pos;
             long id = idParts[0];
-            long[] sizeParts = strictSize(blob, idParts[1]);
+            long[] sizeParts = strictSize(blob, (int) idParts[1]);
             if (sizeParts[0] < 0) return -1;
             int bodyStart = (int) sizeParts[1];
             int bodyEnd = (int) (bodyStart + sizeParts[0]);
@@ -403,7 +403,7 @@ final class YTIndex {
         while (pos < end) {
             long[] idParts = readId(blob, pos);
             if (idParts[0] < 0) return null;
-            long[] sizeParts = readSize(blob, idParts[1]);
+            long[] sizeParts = readSize(blob, (int) idParts[1]);
             if (sizeParts[0] < 0) return null;
             int bodyStart = (int) sizeParts[1];
             int bodyEnd = (int) (bodyStart + sizeParts[0]);
