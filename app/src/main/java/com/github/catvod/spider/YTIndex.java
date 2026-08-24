@@ -302,4 +302,118 @@ final class YTIndex {
         }
         return sb.toString();
     }
+
+    /* ------------------------------------------------------------------ */
+    /* SABR payload cluster split                                         */
+    /* ------------------------------------------------------------------ */
+
+    /** One top-level WebM {@code Cluster} copied out of a SABR media payload. */
+    static class Cluster {
+        final long ptsMs;
+        final byte[] data;
+
+        Cluster(long ptsMs, byte[] data) {
+            this.ptsMs = ptsMs;
+            this.data = data;
+        }
+    }
+
+    private static final long ID_SEGMENT = 0x18538067L;
+    private static final long ID_CLUSTER = 0x1F43B675L;
+    private static final int ID_TIMECODE = 0xE7;
+
+    /**
+     * Splits a SABR media payload into its top-level WebM Clusters, each with its start time.
+     *
+     * <p>The micro-segment bridge needs this because one native SABR segment spans several declared
+     * MPD windows: each window must receive exactly the clusters whose Timecode falls inside it, so
+     * the union over all windows reproduces the payload once — no holes, no duplicates. Timestamps
+     * use the default TimecodeScale (1 ms per unit); YouTube streams keep the default.
+     *
+     * @return the clusters in stream order, or {@code null} when the payload is not a cleanly
+     *         parseable cluster sequence (caller then falls back to serving it whole).
+     */
+    static List<Cluster> splitWebmClusters(byte[] blob) {
+        if (blob == null || blob.length == 0) return null;
+        List<Cluster> out = new ArrayList<>();
+        int pos = walkClusters(blob, 0, blob.length, out, 0);
+        if (pos != blob.length || out.isEmpty()) return null;
+        return out;
+    }
+
+    /**
+     * Walks master-element children collecting Clusters; descends into {@code Segment} wrappers.
+     *
+     * @return the end position on success, -1 on any structural surprise.
+     */
+    private static int walkClusters(byte[] blob, int start, int end, List<Cluster> out, int depth) {
+        if (depth > 2) return -1;
+        int pos = start;
+        while (pos < end) {
+            long[] idParts = readId(blob, pos);
+            if (idParts[0] < 0) return -1;
+            int idStart = pos;
+            long id = idParts[0];
+            long[] sizeParts = strictSize(blob, idParts[1]);
+            if (sizeParts[0] < 0) return -1;
+            int bodyStart = (int) sizeParts[1];
+            int bodyEnd = (int) (bodyStart + sizeParts[0]);
+            if (bodyEnd > end) return -1;
+            if (id == ID_SEGMENT) {
+                // Descend instead of skipping: SABR payloads may arrive wrapped in one Segment.
+                int inner = walkClusters(blob, bodyStart, bodyEnd, out, depth + 1);
+                if (inner != bodyEnd) return -1;
+            } else if (id == ID_CLUSTER) {
+                Long pts = clusterTimecode(blob, bodyStart, bodyEnd);
+                if (pts == null) return -1;
+                byte[] copy = new byte[bodyEnd - idStart];
+                System.arraycopy(blob, idStart, copy, 0, copy.length);
+                out.add(new Cluster(pts, copy));
+            }
+            pos = bodyEnd;
+        }
+        return pos;
+    }
+
+    /**
+     * Like {@link #readSize} but rejects EBML "unknown size" (all-ones): a mid-stream element with
+     * no declared length would silently swallow the rest of the payload, so the splitter must bail
+     * and let the caller serve the segment whole instead of truncating it.
+     */
+    private static long[] strictSize(byte[] blob, int pos) {
+        if (pos >= blob.length) return new long[]{-1, pos};
+        int first = blob[pos] & 0xFF;
+        int mask = 0x80;
+        int length = 1;
+        while (length <= 8 && (first & mask) == 0) {
+            mask >>= 1;
+            length++;
+        }
+        if (length > 8 || pos + length > blob.length) return new long[]{-1, pos};
+        long value = first & (mask - 1);
+        for (int i = pos + 1; i < pos + length; i++) value = (value << 8) | (blob[i] & 0xFF);
+        // All-ones means "unknown size" — reject before it can swallow the payload tail.
+        if (value == (1L << (7 * length)) - 1) return new long[]{-1, pos};
+        return new long[]{value, pos + length};
+    }
+
+    /** Finds the Cluster's {@code Timecode} child; {@code null} when absent or malformed. */
+    private static Long clusterTimecode(byte[] blob, int start, int end) {
+        int pos = start;
+        while (pos < end) {
+            long[] idParts = readId(blob, pos);
+            if (idParts[0] < 0) return null;
+            long[] sizeParts = readSize(blob, idParts[1]);
+            if (sizeParts[0] < 0) return null;
+            int bodyStart = (int) sizeParts[1];
+            int bodyEnd = (int) (bodyStart + sizeParts[0]);
+            if (bodyEnd > end) return null;
+            if (idParts[0] == ID_TIMECODE) {
+                if (sizeParts[0] <= 0 || sizeParts[0] > 8) return null;
+                return ebmlUint(blob, bodyStart, bodyEnd);
+            }
+            pos = bodyEnd;
+        }
+        return null;
+    }
 }

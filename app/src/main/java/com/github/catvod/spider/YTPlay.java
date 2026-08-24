@@ -2,6 +2,7 @@ package com.github.catvod.spider;
 
 import android.text.TextUtils;
 
+import com.github.catvod.crawler.SpiderDebug;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -30,6 +31,11 @@ import java.util.Set;
  *       {@code SegmentTemplate/$Number$}; {@code sabr_mpd2} uses {@code SegmentBase} byte ranges,
  *       which removes the number-to-native-sequence mapping error entirely.</li>
  * </ul>
+ *
+ * <p>{@code sabr_mpd} additionally supports <b>micro-segment mode</b> (see
+ * {@link #proxySabrMpd}): windows much shorter than real SABR segments keep the player polling,
+ * and each window is answered with just the clusters starting inside it (0-byte 200 when the
+ * window's clusters were already delivered with an earlier window).
  */
 final class YTPlay {
 
@@ -83,6 +89,8 @@ final class YTPlay {
         String stateKey;
         long duration;
         long expires;
+        /** Micro-segment window in ms; 0 = legacy manifest (real timeline rows). */
+        long microSegMs;
     }
 
     /* ------------------------------------------------------------------ */
@@ -713,6 +721,19 @@ final class YTPlay {
     /* SABR manifests                                                     */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Builds the {@code sabr_mpd} manifest (SegmentTemplate/{@code $Number$}).
+     *
+     * <p><b>Micro-segment mode</b> (default): the MPD declares windows far shorter than a real SABR
+     * segment ({@code sabr_micro_seg_ms}, default 1000ms), so the player keeps asking for the next
+     * {$Number$} instead of silently waiting out a declared duration whose payload it has already
+     * exhausted. Each window is answered with exactly the clusters whose Timecode falls inside it;
+     * a window whose clusters were already delivered inside an earlier window gets a 0-byte 200.
+     * The union over windows reproduces each native segment once, so no data can be skipped or
+     * duplicated regardless of how far ahead the player prefetches. Requires WebM on both tracks
+     * (cluster slicing); anything else, or {@code sabr_micro_seg_ms=0}, falls back to the legacy
+     * real-timeline rows.
+     */
     private Object[] proxySabrMpd(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
@@ -723,16 +744,28 @@ final class YTPlay {
         YTFormat audio = data.audioItem;
         long duration = data.duration;
         String base = localUrl("&type=sabr&vid=" + enc(vid) + "&quality=" + enc(quality));
-        long videoSegMs = (long) ((video.sabrConfig == null ? 6 : video.sabrConfig.targetDurationSec) * 1000);
-        if (videoSegMs <= 0) videoSegMs = 6000;
-        long audioSegMs = (long) ((audio.sabrConfig == null ? 10 : audio.sabrConfig.targetDurationSec) * 1000);
-        if (audioSegMs < 8000) audioSegMs = 10000;
-        List<YTFormat.Seg> videoTimeline = loadTimeline(video, duration * 1000);
-        List<YTFormat.Seg> audioTimeline = loadTimeline(audio, duration * 1000);
-        String videoRows = YTIndex.segmentTimelineXml(videoTimeline);
-        String audioRows = YTIndex.segmentTimelineXml(audioTimeline);
-        if (videoRows.isEmpty()) videoRows = evenRows(duration * 1000, videoSegMs);
-        if (audioRows.isEmpty()) audioRows = evenRows(duration * 1000, audioSegMs);
+        long microMs = YouTubeLite.optLong(ext, "sabr_micro_seg_ms", 1000);
+        boolean webmBoth = low(video.mimeType).contains("webm") && low(audio.mimeType).contains("webm");
+        String videoRows;
+        String audioRows;
+        if (microMs > 0 && webmBoth) {
+            data.microSegMs = Math.min(4000, microMs);
+            videoRows = evenRows(duration * 1000, data.microSegMs);
+            audioRows = videoRows;
+            SpiderDebug.log("SABR 微片模式 window=" + data.microSegMs + "ms 时长=" + duration
+                    + "s video=" + low(mimeBase(fallback(video.mimeType, "")))
+                    + " audio=" + low(mimeBase(fallback(audio.mimeType, ""))));
+        } else {
+            data.microSegMs = 0;
+            long videoSegMs = (long) ((video.sabrConfig == null ? 6 : video.sabrConfig.targetDurationSec) * 1000);
+            if (videoSegMs <= 0) videoSegMs = 6000;
+            long audioSegMs = (long) ((audio.sabrConfig == null ? 10 : audio.sabrConfig.targetDurationSec) * 1000);
+            if (audioSegMs < 8000) audioSegMs = 10000;
+            videoRows = YTIndex.segmentTimelineXml(loadTimeline(video, duration * 1000));
+            audioRows = YTIndex.segmentTimelineXml(loadTimeline(audio, duration * 1000));
+            if (videoRows.isEmpty()) videoRows = evenRows(duration * 1000, videoSegMs);
+            if (audioRows.isEmpty()) audioRows = evenRows(duration * 1000, audioSegMs);
+        }
         StringBuilder mpd = new StringBuilder();
         mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
                 .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
@@ -949,9 +982,26 @@ final class YTPlay {
             int requestIndex = data.activeIndex;
             String stateKey = data.stateKey == null ? vid + ":sabr" : data.stateKey;
             YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
+            // Micro-segment mode: a $Number$ maps to a short declared window, not to a native
+            // segment number. Fetch the native segment covering the window's start, then hand out
+            // only its clusters whose Timecode falls inside [winStart, winStart + window). Windows
+            // whose clusters already went out with an earlier window get a 0-byte 200.
+            String fetchKey = segment;
+            long winStart = -1;
+            long winMs = 0;
+            if (!init && data.microSegMs > 0) {
+                try {
+                    long num = Long.parseLong(segment);
+                    winMs = data.microSegMs;
+                    winStart = Math.max(0, (num - 1) * winMs);
+                    fetchKey = "t=" + winStart;
+                } catch (NumberFormatException ignored) {
+                    // Non-numeric media keys keep legacy handling.
+                }
+            }
             try {
                 YTSabrSession.Found found = session(stateKey)
-                        .getSegment(data.videoItem, data.audioItem, track, segment);
+                        .getSegment(data.videoItem, data.audioItem, track, fetchKey);
                 if (found == null || found.media == null) {
                     lastError = found == null ? "empty response" : found.error;
                     if (init && switchClient(vid, requestIndex, cacheKey) != null) continue;
@@ -961,12 +1011,27 @@ final class YTPlay {
                 if (init && latest != null && latest.activeIndex != requestIndex) continue;
                 String contentType = mimeBase(fallback(item == null ? null : item.mimeType,
                         "video".equals(track) ? "video/webm" : "audio/webm"));
+                byte[] payload = found.media;
+                if (winStart >= 0) {
+                    List<YTIndex.Cluster> clusters = YTIndex.splitWebmClusters(found.media);
+                    if (clusters != null) {
+                        payload = windowClusters(clusters, winStart, winMs);
+                        String tag = ("video".equals(track) ? "v#" : "a#") + segment;
+                        if (payload.length == 0) {
+                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 空200(数据已随前窗交付)");
+                        } else {
+                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 簇=" + countClusters(clusters, winStart, winMs)
+                                    + " 字节=" + payload.length + "/" + found.media.length);
+                        }
+                    }
+                    // Unparseable payload: serve it whole rather than stalling the player.
+                }
                 Map<String, String> headers = new LinkedHashMap<>();
                 headers.put("Content-Type", contentType);
-                headers.put("Content-Length", String.valueOf(found.media.length));
+                headers.put("Content-Length", String.valueOf(payload.length));
                 headers.put("Cache-Control", "private, max-age=30");
                 headers.put("Accept-Ranges", "none");
-                return bytes(200, contentType, found.media, headers);
+                return bytes(200, contentType, payload, headers);
             } catch (Throwable e) {
                 lastError = String.valueOf(e);
                 boolean canFailover = init && lastError.contains("SABR HTTP 4");
@@ -979,6 +1044,31 @@ final class YTPlay {
     /* ------------------------------------------------------------------ */
     /* helpers                                                            */
     /* ------------------------------------------------------------------ */
+
+    /** Concatenates the clusters whose start time falls inside one micro window. */
+    private static byte[] windowClusters(List<YTIndex.Cluster> clusters, long winStart, long winMs) {
+        int total = 0;
+        for (YTIndex.Cluster cluster : clusters) {
+            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) total += cluster.data.length;
+        }
+        byte[] out = new byte[total];
+        int pos = 0;
+        for (YTIndex.Cluster cluster : clusters) {
+            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) {
+                System.arraycopy(cluster.data, 0, out, pos, cluster.data.length);
+                pos += cluster.data.length;
+            }
+        }
+        return out;
+    }
+
+    private static int countClusters(List<YTIndex.Cluster> clusters, long winStart, long winMs) {
+        int count = 0;
+        for (YTIndex.Cluster cluster : clusters) {
+            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) count++;
+        }
+        return count;
+    }
 
     private YTHttp.Result fetch(YTFormat item, String url, String range) {
         Map<String, String> headers = new HashMap<>(header);
