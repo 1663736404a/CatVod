@@ -35,14 +35,11 @@ def decodeSpiderJar = tasks.register('decodeSpiderJar', JavaExec) {
 
 def prepareSpiderJar = tasks.register('prepareSpiderJar', Sync) {
     group = 'build'
-    description = 'Stages the filtered spider and JavaScript packages.'
+    description = 'Stages the filtered spider package.'
     dependsOn decodeSpiderJar
     from(spiderTemplate)
     from(decodedDir.map { it.dir('smali/com/github/catvod/spider') }) {
         into 'smali/com/github/catvod/spider'
-    }
-    from(decodedDir.map { it.dir('smali/com/github/catvod/js') }) {
-        into 'smali/com/github/catvod/js'
     }
     into(stagedDir)
 }

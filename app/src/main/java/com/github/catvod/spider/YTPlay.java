@@ -18,24 +18,22 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Playback bridge for the YouTube spider: builds local DASH manifests and answers the segment
- * requests the player issues against them.
+ * Playback bridge for the YouTube spider: builds the local DASH manifest and answers the segment
+ * requests the player issues against it.
  *
- * <p>Two independent bridges live here:
- * <ul>
- *   <li><b>direct</b> ({@code mpd}/{@code media}/{@code single}/{@code yt_progressive}) — plain
- *       googlevideo URLs with real {@code initRange}/{@code indexRange}, proxied byte for byte.</li>
- *   <li><b>SABR</b> ({@code sabr_mpd}/{@code sabr_mpd2}/{@code sabr}/{@code sabr_time}) — formats
- *       with no per-format URL, negotiated through {@link YTSabrSession}. {@code sabr_mpd} uses
- *       local segment numbers; {@code sabr_mpd2} uses target-time URLs backed by real SABR
- *       MEDIA_HEADER/native-sequence mapping and the session cache.</li>
- * </ul>
+ * <p>One bridge only: {@code sabr_mpd} publishes a micro-window {@code $Time$} SegmentTemplate and
+ * {@code sabr_time} serves each window from {@link YTSabrSession}. Formats reached this way have no
+ * per-format URL and are negotiated entirely through SABR/UMP.
+ *
+ * <p><b>Micro-window scheme.</b> The MPD declares windows much shorter than a real SABR segment
+ * ({@code sabr_micro_seg_ms}, default 1000ms) so the player keeps requesting the next one instead
+ * of waiting out a declared duration whose payload it has already consumed. A native segment is
+ * delivered whole by the single window that owns it — {@code owner = ceil(start/win)*win} — and
+ * every other window answers 0 bytes with HTTP 200.
  */
 final class YTPlay {
 
-    private static final long PLAY_CACHE_MS = 21600 * 1000L;
     private static final long SABR_CACHE_MS = 1800 * 1000L;
-    private static final String[] RISKY_AUDIO = {"ec-3", "ec3", "eac3", "ac-3", "ac3", "dts", "truehd"};
 
     private static final java.util.concurrent.atomic.AtomicLong OWNER_SEQ =
             new java.util.concurrent.atomic.AtomicLong();
@@ -47,7 +45,6 @@ final class YTPlay {
     /** Identifies this YTPlay instance inside {@link YTServer}'s owner registry. */
     private final String ownerId = "p" + OWNER_SEQ.incrementAndGet();
 
-    private final Map<String, PlayData> playCache = new HashMap<>();
     private final Map<String, SabrData> sabrCache = new HashMap<>();
     // A and B can request the same video MPD concurrently. Serialize extraction per video so
     // both routes share one successful TVHTML5/poToken response instead of racing BotGuard.
@@ -62,7 +59,6 @@ final class YTPlay {
     private static final Map<String, String> sabrSignatures = new HashMap<>();
     /** State keys created by this instance; only these may be torn down by it. */
     private final Set<String> ownedStateKeys = Collections.synchronizedSet(new HashSet<>());
-    private final Object sabrSwitchLock = new Object();
     private volatile boolean destroyed;
     private volatile boolean destroyRequested;
     /** Last time the player itself asked for media; drives deferred teardown. */
@@ -76,17 +72,6 @@ final class YTPlay {
         this.ext = ext;
         this.siteKey = siteKey;
         YTServer.register(ownerId, this);
-    }
-
-    /** Cached direct-play tracks for one {@code vid + quality} pair. */
-    private static class PlayData {
-        List<YTFormat> videoTracks = new ArrayList<>();
-        YTFormat videoItem;
-        YTFormat audioItem;
-        List<YTFormat> audioCandidates = new ArrayList<>();
-        List<String> failedAudioKeys = new ArrayList<>();
-        long duration;
-        long expires;
     }
 
     /** One compatible SABR client pairing. */
@@ -107,6 +92,8 @@ final class YTPlay {
         String stateKey;
         long duration;
         long expires;
+        /** Micro-window size in ms, published in the manifest and used for owner arithmetic. */
+        long microSegMs;
     }
 
     /* ------------------------------------------------------------------ */
@@ -182,7 +169,7 @@ final class YTPlay {
         // (observed at +15s and +18s), and by then the host may have cleared its jar-loader, which
         // answers those refetches with HTTP 500 null_or_empty and kills playback. Redirecting once
         // gets the player a durable URL for every later manifest refresh.
-        if ("sabr_mpd".equals(type) || "sabr_mpd2".equals(type)) {
+        if ("sabr_mpd".equals(type)) {
             // A manifest request is the first sign the player moved to another video. Stop the
             // previous one's producer here rather than waiting for a size-based reap that a busy
             // (and therefore non-idle) session never triggers.
@@ -194,26 +181,10 @@ final class YTPlay {
             }
         }
         switch (type) {
-            case "mpd":
-                return proxyMpd(params);
-            case "media":
-                return proxyMedia(params);
-            case "single":
-                return proxySingle(params);
-            case "yt_progressive":
-                return proxyProgressive(params);
             case "sabr_mpd":
                 return proxySabrMpd(params);
-            // SABR-B now uses a target-time SegmentTemplate backed by real MEDIA_HEADER mapping.
-            // Keep the old route name so existing quality-menu URLs remain compatible.
-            case "sabr_mpd2":
-                return proxySabrMpd2(params);
             case "sabr_time":
                 return proxySabrTime(params);
-            case "sabr_range":
-                return proxySabrRange(params);
-            case "sabr":
-                return proxySabr(params);
             default:
                 return null;
         }
@@ -259,20 +230,6 @@ final class YTPlay {
         return key;
     }
 
-    /* ------------------------------------------------------------------ */
-    /* direct track selection                                             */
-    /* ------------------------------------------------------------------ */
-
-    private static String audioKey(YTFormat item) {
-        if (item == null) return "";
-        return low(item.client) + "|" + item.itag + "|" + low(item.codecs);
-    }
-
-    private static String audioSignature(YTFormat item) {
-        if (item == null) return "";
-        return item.itag + "|" + low(mimeBase(item.mimeType)) + "|" + low(item.codecs);
-    }
-
     private static String low(String text) {
         return text == null ? "" : text.toLowerCase(Locale.US);
     }
@@ -283,339 +240,9 @@ final class YTPlay {
         return index < 0 ? mime : mime.substring(0, index);
     }
 
-    private static int codecRank(YTFormat item) {
-        String text = low(item.codecs) + " " + low(item.mimeType);
-        if (text.contains("mp4a") || text.contains("aac")) return 5;
-        if (text.contains("opus")) return 4;
-        if (text.contains("vorbis")) return 3;
-        if (text.contains("mp3")) return 2;
-        return 1;
-    }
-
-    private static int clientOrder(String client) {
-        String name = client == null ? "" : client.toUpperCase(Locale.US);
-        switch (name) {
-            case "ANDROID_VR":
-                return 6;
-            case "IOS":
-                return 5;
-            case "MWEB":
-                return 4;
-            case "ANDROID":
-                return 3;
-            case "WEB_INITIAL":
-                return 2;
-            case "WEB":
-                return 1;
-            default:
-                return 0;
-        }
-    }
-
-    /**
-     * Ranks direct audio-only formats.
-     *
-     * <p>EC-3/AC-3 and friends are only used when nothing else exists, so a high-bitrate surround
-     * track can never displace plain AAC.
-     */
-    private List<YTFormat> audioCandidates(List<YTFormat> formats, List<String> failedKeys,
-                                           String requiredSignature, String sameClient) {
-        Set<String> failed = failedKeys == null ? new HashSet<>() : new HashSet<>(failedKeys);
-        String requiredClient = sameClient == null ? "" : sameClient.toUpperCase(Locale.US);
-        List<YTFormat> audios = new ArrayList<>();
-        for (YTFormat item : formats) {
-            if (item.isSabr() || TextUtils.isEmpty(item.url)) continue;
-            if (!item.hasAudio() || item.hasVideo()) continue;
-            if (!requiredClient.isEmpty() && !requiredClient.equals(low(item.client).toUpperCase(Locale.US))) continue;
-            if (failed.contains(audioKey(item))) continue;
-            audios.add(item);
-        }
-        List<YTFormat> safe = new ArrayList<>();
-        for (YTFormat item : audios) {
-            String text = low(item.codecs) + " " + low(item.mimeType);
-            boolean risky = false;
-            for (String marker : RISKY_AUDIO) {
-                if (text.contains(marker)) {
-                    risky = true;
-                    break;
-                }
-            }
-            if (!risky) safe.add(item);
-        }
-        if (!safe.isEmpty()) audios = safe;
-        if (requiredSignature != null) {
-            List<YTFormat> matched = new ArrayList<>();
-            for (YTFormat item : audios) if (requiredSignature.equals(audioSignature(item))) matched.add(item);
-            audios = matched;
-        }
-        audios.sort((a, b) -> {
-            int cmp = Integer.compare(codecRank(b), codecRank(a));
-            if (cmp != 0) return cmp;
-            cmp = Integer.compare(clientOrder(b.client), clientOrder(a.client));
-            if (cmp != 0) return cmp;
-            cmp = Integer.compare(b.itag == 140 ? 1 : 0, a.itag == 140 ? 1 : 0);
-            if (cmp != 0) return cmp;
-            return Long.compare(b.bitrate, a.bitrate);
-        });
-        List<YTFormat> result = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
-        for (YTFormat item : audios) {
-            String key = audioKey(item);
-            if (seen.contains(key)) continue;
-            seen.add(key);
-            result.add(item);
-        }
-        return result;
-    }
-
-    /**
-     * Switches to the next cached audio candidate after a 403.
-     *
-     * <p>The MPD has already been published, so only a candidate with the same itag/container/codec
-     * may be substituted; anything else would break SegmentBase compatibility.
-     */
-    private YTFormat nextCachedAudio(PlayData data, YTFormat failedItem) {
-        List<String> failedKeys = new ArrayList<>(data.failedAudioKeys);
-        String failedKey = audioKey(failedItem);
-        if (!failedKeys.contains(failedKey)) failedKeys.add(failedKey);
-        String signature = audioSignature(data.audioItem == null ? failedItem : data.audioItem);
-        List<YTFormat> remaining = new ArrayList<>();
-        for (YTFormat item : data.audioCandidates) {
-            if (failedKeys.contains(audioKey(item))) continue;
-            if (!signature.equals(audioSignature(item))) continue;
-            remaining.add(item);
-        }
-        data.failedAudioKeys = failedKeys;
-        if (remaining.isEmpty()) return null;
-        data.audioItem = remaining.get(0);
-        return data.audioItem;
-    }
-
-    /**
-     * Re-resolves direct tracks when the cache is gone or a URL was rejected.
-     *
-     * <p>Forced refreshes are throttled: one per 10s per {@code vid+quality}. Without it every
-     * rejected Range triggers its own extraction, and the refreshed URLs get rejected just as fast.
-     */
-    private PlayData rebuild(String vid, String quality, boolean forceRefresh,
-                             List<String> failedAudioKeys, String requiredAudioSignature) {
-        String cacheKey = "yt_" + vid + "_" + quality;
-        if (forceRefresh) {
-            synchronized (refreshMarks) {
-                Long last = refreshMarks.get(cacheKey);
-                if (last != null && System.currentTimeMillis() - last < 10000) {
-                    PlayData cached = playCache.get(cacheKey);
-                    if (cached != null) return cached;
-                }
-                refreshMarks.put(cacheKey, System.currentTimeMillis());
-            }
-        }
-        try {
-            YouTubeLite.Extracted data = yt.extract(vid, forceRefresh);
-            String select = "8k".equals(quality) || "8k_hdr".equals(quality) || "4k".equals(quality)
-                    || "2k".equals(quality) || "1080p".equals(quality) ? quality : "best";
-            List<YTFormat> allTracks = yt.chooseVideoTracks(directOnly(data.formats), select);
-            String wanted = "hdr".equals(quality) || "8k_hdr".equals(quality) ? "HDR" : "SDR";
-            List<YTFormat> videoTracks = new ArrayList<>();
-            for (YTFormat item : allTracks) if (wanted.equals(item.trackName)) videoTracks.add(item);
-            if (videoTracks.isEmpty() && !allTracks.isEmpty()
-                    && !"8k".equals(quality) && !"8k_hdr".equals(quality)) {
-                videoTracks.add(allTracks.get(0));
-            }
-            List<YTFormat> candidates = audioCandidates(data.formats, failedAudioKeys, requiredAudioSignature, null);
-            if (candidates.isEmpty() && failedAudioKeys != null && !failedAudioKeys.isEmpty()) {
-                // Every same-format candidate was rejected; retry without the failure list so
-                // playback can continue on a freshly signed URL.
-                candidates = audioCandidates(data.formats, null, null, null);
-            }
-            if (videoTracks.isEmpty() || candidates.isEmpty()) return null;
-            PlayData value = new PlayData();
-            value.videoTracks = videoTracks;
-            value.videoItem = videoTracks.get(0);
-            value.audioItem = candidates.get(0);
-            value.audioCandidates = candidates;
-            value.failedAudioKeys = failedAudioKeys == null ? new ArrayList<>() : new ArrayList<>(failedAudioKeys);
-            value.duration = data.duration;
-            value.expires = System.currentTimeMillis() + PLAY_CACHE_MS;
-            playCache.put(cacheKey, value);
-            return value;
-        } catch (Throwable e) {
-            return null;
-        }
-    }
-
-    private static List<YTFormat> directOnly(List<YTFormat> formats) {
-        List<YTFormat> out = new ArrayList<>();
-        for (YTFormat item : formats) {
-            if (item.isSabr() || TextUtils.isEmpty(item.url)) continue;
-            out.add(item);
-        }
-        return out;
-    }
-
     /* ------------------------------------------------------------------ */
     /* direct proxies                                                     */
     /* ------------------------------------------------------------------ */
-
-    private Object[] proxyMpd(Map<String, String> params) {
-        String vid = params.get("vid");
-        String quality = params.get("quality") == null ? "1080p" : params.get("quality");
-        PlayData data = vid == null ? null : playCache.get("yt_" + vid + "_" + quality);
-        if (data == null && vid != null) data = rebuild(vid, quality, false, null, null);
-        if (data == null) return text(404, "视频缓存已过期或不存在");
-        List<YTFormat> videoTracks = data.videoTracks.isEmpty()
-                ? Collections.singletonList(data.videoItem) : data.videoTracks;
-        YTFormat audio = data.audioItem;
-        boolean direct = "direct".equalsIgnoreCase(YouTubeLite.optString(ext, "seg", "proxy"));
-        String mediaBase = localUrl("&type=media&vid=" + enc(vid) + "&quality=" + enc(quality));
-        StringBuilder mpd = new StringBuilder();
-        mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-                .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
-                .append(data.duration).append("S\" minBufferTime=\"PT1.5S\" ")
-                .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
-                .append("  <Period id=\"1\" start=\"PT0S\">\n");
-        for (YTFormat item : videoTracks) {
-            if (item == null) continue;
-            String baseUrl = direct ? item.url : mediaBase + "&track=video&itag=" + item.itag;
-            mpd.append("    <AdaptationSet mimeType=\"").append(esc(mimeBase(fallback(item.mimeType, "video/webm"))))
-                    .append("\" startWithSAP=\"1\" segmentAlignment=\"true\" scanType=\"progressive\">\n")
-                    .append("      <Representation id=\"v").append(item.itag == 0 ? 1 : item.itag)
-                    .append("\" bandwidth=\"").append(item.bitrate == 0 ? 1000000 : item.bitrate)
-                    .append("\" codecs=\"").append(esc(item.codecs))
-                    .append("\" height=\"").append(item.height).append("\" width=\"").append(item.width).append("\">\n")
-                    .append("        <BaseURL>").append(esc(baseUrl)).append("</BaseURL>\n")
-                    .append("        <SegmentBase indexRange=\"").append(rangeText(item.indexRange))
-                    .append("\"><Initialization range=\"").append(rangeText(item.initRange)).append("\"/></SegmentBase>\n")
-                    .append("      </Representation>\n")
-                    .append("    </AdaptationSet>\n");
-        }
-        if (audio != null && !TextUtils.isEmpty(audio.url)) {
-            String baseUrl = direct ? audio.url : mediaBase + "&track=audio";
-            mpd.append("    <AdaptationSet mimeType=\"").append(esc(mimeBase(fallback(audio.mimeType, "audio/mp4"))))
-                    .append("\" startWithSAP=\"1\" segmentAlignment=\"true\" lang=\"und\">\n")
-                    .append("      <Representation id=\"audio\" bandwidth=\"")
-                    .append(audio.bitrate == 0 ? 128000 : audio.bitrate)
-                    .append("\" codecs=\"").append(esc(audio.codecs)).append("\" audioSamplingRate=\"44100\">\n")
-                    .append("        <BaseURL>").append(esc(baseUrl)).append("</BaseURL>\n")
-                    .append("        <SegmentBase indexRange=\"").append(rangeText(audio.indexRange))
-                    .append("\"><Initialization range=\"").append(rangeText(audio.initRange)).append("\"/></SegmentBase>\n")
-                    .append("      </Representation>\n")
-                    .append("    </AdaptationSet>\n");
-        }
-        mpd.append("  </Period>\n</MPD>");
-        return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
-    }
-
-    private Object[] proxyMedia(Map<String, String> params) {
-        String vid = params.get("vid");
-        String quality = params.get("quality") == null ? "1080p" : params.get("quality");
-        String track = params.get("track");
-        boolean known = "video".equals(track) || "audio".equals(track);
-        String cacheKey = "yt_" + vid + "_" + quality;
-        PlayData data = vid == null ? null : playCache.get(cacheKey);
-        if (data == null && vid != null && known) data = rebuild(vid, quality, false, null, null);
-        if (data == null || !known) return text(404, "媒体不存在");
-        YTFormat item = selectTrack(data, track, params.get("itag"));
-        if (item == null || TextUtils.isEmpty(item.url)) return text(404, track + " 流不存在");
-        String range = range(params);
-        YTHttp.Result response = fetch(item, item.url, range);
-        if (response.code == 403) {
-            boolean retried = false;
-            if ("audio".equals(track)) {
-                YTFormat next = nextCachedAudio(data, item);
-                if (next != null) {
-                    item = next;
-                    response = fetch(item, item.url, range);
-                    retried = true;
-                }
-            }
-            if (!retried || response.code == 403) {
-                List<String> failed = new ArrayList<>(data.failedAudioKeys);
-                if ("audio".equals(track)) {
-                    String key = audioKey(item);
-                    if (!failed.contains(key)) failed.add(key);
-                }
-                String signature = "audio".equals(track)
-                        ? audioSignature(data.audioItem == null ? item : data.audioItem) : null;
-                PlayData fresh = rebuild(vid, quality, true, "audio".equals(track) ? failed : null, signature);
-                if (fresh != null) {
-                    data = fresh;
-                    YTFormat refreshed = selectTrack(fresh, track, params.get("itag"));
-                    if (refreshed != null && !TextUtils.isEmpty(refreshed.url)) {
-                        item = refreshed;
-                        response = fetch(item, item.url, range);
-                    }
-                }
-            }
-        }
-        String contentType = fallback(response.contentType, "application/octet-stream");
-        Map<String, String> headers = mediaHeaders(contentType, response);
-        return bytes(response.code, contentType, response.body, headers);
-    }
-
-    private YTFormat selectTrack(PlayData data, String track, String wantItag) {
-        if ("video".equals(track)) {
-            List<YTFormat> tracks = data.videoTracks.isEmpty()
-                    ? Collections.singletonList(data.videoItem) : data.videoTracks;
-            for (YTFormat item : tracks) {
-                if (item != null && String.valueOf(item.itag).equals(wantItag)) return item;
-            }
-            return tracks.isEmpty() ? null : tracks.get(0);
-        }
-        return data.audioItem;
-    }
-
-    private Object[] proxySingle(Map<String, String> params) {
-        String vid = params.get("vid");
-        PlayData data = vid == null ? null : playCache.get("yt_single_" + vid);
-        if (data == null) return text(404, "播放缓存已过期或不存在");
-        YTFormat item = data.videoItem;
-        if (item == null || TextUtils.isEmpty(item.url)) return text(404, "播放地址不存在");
-        YTHttp.Result response = fetch(item, item.url, range(params));
-        String contentType = fallback(response.contentType, "video/mp4");
-        return bytes(response.code, contentType, response.body, mediaHeaders(contentType, response));
-    }
-
-    /**
-     * Serves a muxed (progressive) stream in bounded chunks.
-     *
-     * <p>An open-ended Range is never forwarded: the whole file would be buffered in memory before
-     * the player received anything.
-     */
-    private Object[] proxyProgressive(Map<String, String> params) {
-        String vid = params.get("vid");
-        if (vid == null) return text(404, "渐进式播放地址不存在");
-        long chunk = YouTubeLite.optLong(ext, "progressive_chunk_bytes", 16 * 1024 * 1024);
-        chunk = Math.min(32 * 1024 * 1024, Math.max(1024 * 1024, chunk));
-        long start = 0;
-        Long end = null;
-        long[] parsed = parseRange(range(params));
-        if (parsed != null) {
-            start = parsed[0] < 0 ? 0 : parsed[0];
-            end = parsed[1] < 0 ? null : parsed[1];
-        }
-        if (end == null) end = start + chunk - 1;
-        String bounded = "bytes=" + start + "-" + end;
-        try {
-            List<YTFormat> muxed = new ArrayList<>();
-            for (YTFormat item : yt.extract(vid).formats) {
-                if (item.isSabr() || TextUtils.isEmpty(item.url)) continue;
-                if (item.hasVideo() && item.hasAudio()) muxed.add(item);
-            }
-            muxed.sort((a, b) -> Long.compare(b.bitrate, a.bitrate));
-            for (YTFormat item : muxed) {
-                YTHttp.Result response = fetch(item, item.url, bounded);
-                if (response.code != 200 && response.code != 206) continue;
-                String contentType = fallback(response.contentType, mimeBase(fallback(item.mimeType, "video/mp4")));
-                Map<String, String> headers = mediaHeaders(contentType, response);
-                int code = response.contentRange == null ? response.code : 206;
-                return bytes(code, contentType, response.body, headers);
-            }
-            return text(502, "所有音视频合流候选均被 YouTube 拒绝");
-        } catch (Throwable e) {
-            return text(502, "YouTube 媒体代理失败: " + e);
-        }
-    }
 
     /* ------------------------------------------------------------------ */
     /* SABR candidates                                                    */
@@ -836,20 +463,6 @@ final class YTPlay {
         return activate(vid, data, 0, cacheKey);
     }
 
-    /** Moves to the next compatible client after an init failure. */
-    private SabrData switchClient(String vid, int failedIndex, String cacheKey) {
-        synchronized (sabrSwitchLock) {
-            String key = cacheKey == null ? "yt_sabr_" + vid : cacheKey;
-            SabrData current = sabrCache.get(key);
-            if (current == null) return null;
-            // Parallel audio/video init may already have handled this exact failure.
-            if (current.activeIndex != failedIndex) return current;
-            int next = current.activeIndex + 1;
-            if (next >= current.candidates.size()) return null;
-            return activate(vid, current, next, key);
-        }
-    }
-
     /**
      * Returns the session for a state key, adopting one that survived a host registry clear.
      *
@@ -1000,76 +613,20 @@ final class YTPlay {
     /* SABR manifests                                                     */
     /* ------------------------------------------------------------------ */
 
-    private Object[] proxySabrMpd(Map<String, String> params) {
-        String vid = params.get("vid");
-        String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String sid = params.get("sid");
-        String cacheKey = sabrCacheKey(vid, quality, sid, false);
-        SabrData data = vid == null ? null : sabrData(vid, quality, cacheKey, true);
-        if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
-        YTFormat video = data.videoItem;
-        YTFormat audio = data.audioItem;
-        long duration = data.duration;
-        String base = localUrl("&type=sabr&vid=" + enc(vid) + "&quality=" + enc(quality)
-                + (TextUtils.isEmpty(sid) ? "" : "&sid=" + enc(sid)));
-        long videoSegMs = (long) ((video.sabrConfig == null ? 6 : video.sabrConfig.targetDurationSec) * 1000);
-        if (videoSegMs <= 0) videoSegMs = 6000;
-        long audioSegMs = (long) ((audio.sabrConfig == null ? 10 : audio.sabrConfig.targetDurationSec) * 1000);
-        if (audioSegMs < 8000) audioSegMs = 10000;
-        List<YTFormat.Seg> videoTimeline = loadTimeline(video, duration * 1000);
-        List<YTFormat.Seg> audioTimeline = loadTimeline(audio, duration * 1000);
-        String videoRows = YTIndex.segmentTimelineXml(videoTimeline);
-        String audioRows = YTIndex.segmentTimelineXml(audioTimeline);
-        if (videoRows.isEmpty()) videoRows = evenRows(duration * 1000, videoSegMs);
-        if (audioRows.isEmpty()) audioRows = evenRows(duration * 1000, audioSegMs);
-        StringBuilder mpd = new StringBuilder();
-        mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
-                .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
-                .append(duration).append("S\" minBufferTime=\"PT10S\" ")
-                .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
-                .append("  <Period id=\"1\" start=\"PT0S\">\n")
-                .append(templateSet(video, base, "video", videoRows, true))
-                .append(templateSet(audio, base, "audio", audioRows, false))
-                .append("  </Period>\n</MPD>");
-        return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
-    }
-
-    private String templateSet(YTFormat item, String base, String track, String rows, boolean video) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"").append(track)
-                .append("\" mimeType=\"").append(esc(mimeBase(fallback(item.mimeType, video ? "video/webm" : "audio/webm"))))
-                .append("\" segmentAlignment=\"true\" startWithSAP=\"1\">\n")
-                .append("      <Representation id=\"sabr-").append(video ? "v" : "a").append(item.itag)
-                .append("\" bandwidth=\"").append(item.bitrate == 0 ? (video ? 1000000 : 128000) : item.bitrate)
-                .append("\" codecs=\"").append(esc(item.codecs)).append("\"");
-        if (video) sb.append(" width=\"").append(item.width).append("\" height=\"").append(item.height).append("\"");
-        sb.append(">\n")
-                .append("        <SegmentTemplate timescale=\"1000\" startNumber=\"1\" initialization=\"")
-                .append(esc(base + "&track=" + track + "&seg=init")).append("\" media=\"")
-                .append(esc(base + "&track=" + track + "&seg=")).append("$Number$\">")
-                .append("<SegmentTimeline>").append(rows).append("</SegmentTimeline></SegmentTemplate>\n")
-                .append("      </Representation>\n")
-                .append("    </AdaptationSet>\n");
-        return sb.toString();
-    }
-
-    private static String evenRows(long totalMs, long segMs) {
-        long repeats = segMs <= 0 ? 0 : Math.max(0, totalMs / segMs - 1);
-        return "<S t=\"0\" d=\"" + segMs + "\" r=\"" + repeats + "\"/>";
-    }
-
     /**
-     * SABR-B manifest backed by target-time requests, not sidx/Cues.
+     * Publishes the micro-window manifest.
      *
-     * <p>The timeline below is only a request grid. Every media URL carries both the requested
-     * presentation time and local segment number. {@link YTSabrSession} then pumps SABR, parses
-     * the real MEDIA_HEADER boundaries, maps the local number to a native sequence, and serves
-     * the cached complete native segment. This keeps B usable for SABR formats that have no
-     * direct URL from which an sidx/Cues index could be read.
+     * <p>The {@code SegmentTimeline} is a pure request grid of {@code sabr_micro_seg_ms} windows
+     * (default 1000ms), deliberately much shorter than a real SABR segment. A player that has
+     * consumed a segment's payload before its declared duration elapses would otherwise sit and
+     * wait; with short windows it keeps asking for the next {@code $Time$}, and
+     * {@link #proxySabrTime} answers either the owning segment or an empty 200.
      *
-     * Final startup/rebuffer stabilization pass: B retries target-time gaps instead of restarting.
+     * <p>Request-driven on purpose: no warm producer is started from the manifest request.
+     * googlevideo issues each {@code VideoPlaybackAbrRequest} at the player's actual position, so
+     * starting a pump at t=0 here would make a resumed or seeked first request queue behind it.
      */
-    private Object[] proxySabrMpd2(Map<String, String> params) {
+    private Object[] proxySabrMpd(Map<String, String> params) {
         String vid = params.get("vid");
         String quality = params.get("quality") == null ? "best" : params.get("quality");
         String sid = params.get("sid");
@@ -1078,31 +635,36 @@ final class YTPlay {
         if (data == null || data.videoItem == null || data.audioItem == null) return text(404, "SABR 音视频缓存不存在");
         long durationMs = Math.max(1000L, data.duration * 1000L);
         String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
-        YTSabrSession bSession = session(stateKey);
-        bSession.touch();
-        // SABR-B is request-driven: do not start a background warm producer from the MPD request.
-        // googlevideo/PipePipe issue each VideoPlaybackAbrRequest at the player's actual time and
-        // consume the complete MEDIA_END returned by that transaction. Starting from t=0 here is
-        // wrong for resume/seek playback and makes the first t=64s request wait behind a 4K pump.
-        // The media endpoint below calls getSegment() synchronously with its requested t= value.
-        List<YTFormat.Seg> videoReal = new ArrayList<>();
-        List<YTFormat.Seg> audioReal = new ArrayList<>();
-        String videoRows = timeRows(videoReal, durationMs, sabrRequestGridMs(data.videoItem, true));
-        String audioRows = timeRows(audioReal, durationMs, sabrRequestGridMs(data.audioItem, false));
-        com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B MPD: vid=" + vid
-                + ", videoReal=" + videoReal.size() + ", audioReal=" + audioReal.size()
-                + ", videoGridMs=" + sabrRequestGridMs(data.videoItem, true)
-                + ", audioGridMs=" + sabrRequestGridMs(data.audioItem, false));
+        session(stateKey).touch();
+        long winMs = microWindowMs();
+        data.microSegMs = winMs;
+        String rows = windowRows(durationMs, winMs);
+        com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 MPD: vid=" + vid
+                + ", window=" + winMs + "ms, 时长=" + data.duration
+                + "s, video=" + low(mimeBase(fallback(data.videoItem.mimeType, "")))
+                + ", audio=" + low(mimeBase(fallback(data.audioItem.mimeType, ""))));
         StringBuilder mpd = new StringBuilder();
         mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
                 .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT")
                 .append(data.duration).append("S\" minBufferTime=\"PT30S\" ")
                 .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\">\n")
                 .append("  <Period id=\"1\" start=\"PT0S\">\n")
-                .append(timeTemplateSet(vid, quality, sid, data.videoItem, "video", true, videoRows))
-                .append(timeTemplateSet(vid, quality, sid, data.audioItem, "audio", false, audioRows))
+                .append(timeTemplateSet(vid, quality, sid, data.videoItem, "video", true, rows))
+                .append(timeTemplateSet(vid, quality, sid, data.audioItem, "audio", false, rows))
                 .append("  </Period>\n</MPD>");
         return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
+    }
+
+    /** Window size in ms, clamped so a window is always shorter than a plausible native segment. */
+    private long microWindowMs() {
+        long value = YouTubeLite.optLong(ext, "sabr_micro_seg_ms", 1000);
+        return Math.max(200L, Math.min(4000L, value));
+    }
+
+    /** Uniform {@code <S t d>} grid covering the whole presentation. */
+    private static String windowRows(long durationMs, long winMs) {
+        long count = Math.max(1L, (durationMs + winMs - 1) / winMs);
+        return "<S t=\"0\" d=\"" + winMs + "\" r=\"" + (count - 1) + "\"/>";
     }
 
     private String timeTemplateSet(String vid, String quality, String sid, YTFormat item, String track,
@@ -1117,7 +679,7 @@ final class YTPlay {
                 .append(track).append("\" mimeType=\"")
                 .append(esc(mimeBase(fallback(item.mimeType, video ? "video/webm" : "audio/webm"))))
                 .append("\" segmentAlignment=\"true\" startWithSAP=\"1\">\n")
-                .append("      <Representation id=\"sabr-b-").append(video ? "v" : "a").append(item.itag)
+                .append("      <Representation id=\"sabr-").append(video ? "v" : "a").append(item.itag)
                 .append("\" bandwidth=\"").append(item.bitrate == 0 ? (video ? 1000000 : 128000) : item.bitrate)
                 .append("\" codecs=\"").append(esc(item.codecs)).append("\"");
         if (video) sb.append(" width=\"").append(item.width).append("\" height=\"").append(item.height).append("\"");
@@ -1131,117 +693,24 @@ final class YTPlay {
         return sb.toString();
     }
 
-    private List<YTFormat.Seg> warmSabrTimeline(SabrData data, String stateKey, String track) {
-        List<YTFormat.Seg> empty = new ArrayList<>();
-        if (data == null || data.videoItem == null || data.audioItem == null) return empty;
-        try {
-            YTSabrSession sabr = session(stateKey);
-            // One init request establishes the UMP/SABR session and normally also returns the
-            // first MEDIA_HEADERs. A target-time request then pumps until the first real media
-            // interval is cached. Later MPD requests reuse this same session and cache.
-            sabr.getSegment(data.videoItem, data.audioItem, track, "init");
-            sabr.getSegment(data.videoItem, data.audioItem, track, "t=0");
-            int itag = "video".equals(track) ? data.videoItem.itag : data.audioItem.itag;
-            return sabr.snapshotTimeline(itag);
-        } catch (Throwable e) {
-            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 时间轴预热失败: track="
-                    + track + ", error=" + String.valueOf(e));
-            return empty;
-        }
-    }
-
-    private static String timeRows(List<YTFormat.Seg> real, long durationMs, long fallbackMs) {
-        StringBuilder rows = new StringBuilder();
-        long cursor = 0;
-        if (real != null) {
-            for (YTFormat.Seg seg : real) {
-                if (seg == null || seg.d <= 0 || seg.t < cursor || seg.t >= durationMs) continue;
-                rows.append("<S t=\"").append(seg.t).append("\" d=\"")
-                        .append(Math.min(seg.d, durationMs - seg.t)).append("\"/>");
-                cursor = Math.min(durationMs, seg.t + seg.d);
-            }
-        }
-        long step = Math.max(1000L, fallbackMs);
-        while (cursor < durationMs) {
-            long d = Math.min(step, durationMs - cursor);
-            rows.append("<S t=\"").append(cursor).append("\" d=\"")
-                    .append(Math.max(1L, d)).append("\"/>");
-            cursor += d;
-        }
-        return rows.toString();
-    }
-
-    private long sabrRequestGridMs(YTFormat item, boolean video) {
-        double target = item != null && item.sabrConfig != null ? item.sabrConfig.targetDurationSec : 0;
-        long ms = target > 0 ? (long) (target * 1000.0) : (video ? 6000L : 10000L);
-        if (video && ms < 3000L) ms = 6000L;
-        if (!video && ms < 8000L) ms = 10000L;
-        return Math.max(1000L, ms);
-    }
-
-    private static String virtualTimeRows(long durationMs, long segmentMs) {
-        StringBuilder rows = new StringBuilder();
-        long t = 0;
-        long step = Math.max(1000L, segmentMs);
-        while (t < durationMs) {
-            long d = Math.min(step, durationMs - t);
-            rows.append("<S t=\"").append(t).append("\" d=\"").append(Math.max(1L, d)).append("\"/>");
-            t += d;
-        }
-        return rows.toString();
-    }
-
-    private String baseSet(String vid, YTFormat item, String track, boolean video) {
-        long[] initRange = item.indexSource != null && item.indexSource.initRange != null
-                ? item.indexSource.initRange : item.initRange;
-        long[] indexRange = item.indexSource != null && item.indexSource.indexRange != null
-                ? item.indexSource.indexRange : item.indexRange;
-        String base = localUrl("&type=sabr_range&vid=" + enc(vid) + "&track=" + track);
-        StringBuilder sb = new StringBuilder();
-        sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2).append("\" contentType=\"").append(track)
-                .append("\" mimeType=\"").append(esc(mimeBase(fallback(item.mimeType, video ? "video/webm" : "audio/mp4"))))
-                .append("\" segmentAlignment=\"true\" startWithSAP=\"1\">\n")
-                .append("      <Representation id=\"sabr-").append(video ? "v" : "a").append(item.itag)
-                .append("\" bandwidth=\"").append(item.bitrate == 0 ? (video ? 1000000 : 128000) : item.bitrate)
-                .append("\" codecs=\"").append(esc(item.codecs)).append("\"");
-        if (video) sb.append(" width=\"").append(item.width).append("\" height=\"").append(item.height).append("\"");
-        sb.append(">\n")
-                .append("        <BaseURL>").append(esc(base)).append("</BaseURL>\n")
-                .append("        <SegmentBase indexRange=\"").append(rangeText(indexRange))
-                .append("\" indexRangeExact=\"true\">\n")
-                .append("          <Initialization range=\"").append(rangeText(initRange)).append("\"/>\n")
-                .append("        </SegmentBase>\n")
-                .append("      </Representation>\n")
-                .append("    </AdaptationSet>\n");
-        return sb.toString();
-    }
-
-    /** Fetches and caches a format's real segment index, so the manifest carries exact t/d values. */
-    private List<YTFormat.Seg> loadTimeline(YTFormat item, long totalMs) {
-        if (item.timeline != null && !item.timeline.isEmpty()) return item.timeline;
-        YTFormat.IndexSource source = item.indexSource;
-        if (source == null || TextUtils.isEmpty(source.url) || source.indexRange == null) return new ArrayList<>();
-        long start = source.indexRange[0];
-        long end = source.indexRange[1];
-        if (end < start) return new ArrayList<>();
-        Map<String, String> headers = new HashMap<>(header);
-        headers.putAll(source.headers);
-        YTHttp.Result response = yt.http().get(source.url, headers, "bytes=" + start + "-" + end);
-        if (response.code != 200 && response.code != 206) return new ArrayList<>();
-        List<YTFormat.Seg> timeline = low(item.mimeType).contains("webm")
-                ? YTIndex.parseWebmCues(response.body, totalMs)
-                : YTIndex.parseMp4Sidx(response.body, totalMs);
-        if (timeline != null && !timeline.isEmpty()) item.timeline = timeline;
-        return timeline == null ? new ArrayList<>() : timeline;
-    }
-
     /* ------------------------------------------------------------------ */
     /* SABR segments                                                      */
     /* ------------------------------------------------------------------ */
 
     /**
-     * Serves B's target-time media requests. The DASH grid is only a hint; the SABR session
-     * returns the complete cached native segment whose real MEDIA_HEADER range covers targetMs.
+     * Serves one micro window.
+     *
+     * <p>The requested {@code t=} is a window start, not a segment boundary. The session returns the
+     * complete native segment whose real MEDIA_HEADER interval covers that instant; this method then
+     * decides whether the window <em>owns</em> that segment. Ownership is
+     * {@code owner = ceil(start/win)*win} — the first window boundary at or after the segment start
+     * — so each native segment is handed to the player by exactly one window and every other window
+     * gets an empty 200. That keeps the player polling (which is the point of the short windows)
+     * without ever duplicating or skipping payload, regardless of how far ahead it prefetches.
+     *
+     * <p>Because a window is shorter than a native segment, {@code owner} always falls inside the
+     * segment, so the owning window's request really does resolve to that segment. Segments shorter
+     * than a window cannot satisfy that and fall back to the window containing their start.
      */
     private Object[] proxySabrTime(Map<String, String> params) {
         String vid = params.get("vid");
@@ -1255,26 +724,27 @@ final class YTPlay {
         SabrData data = vid == null ? null : sabrCache.get(cacheKey);
         if (data == null && vid != null) data = sabrData(vid, quality, cacheKey, true);
         if (data == null || data.videoItem == null || data.audioItem == null) {
-            return text(404, "SABR-B 缓存不存在");
+            return text(404, "SABR 缓存不存在");
         }
         YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
         // Keep one SABR protocol session for both tracks. The playback cookie, rn sequence and
         // buffered context are shared by the video and audio itags; the session lock is fair so
         // a large 4K video pump still yields between requests.
         String stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
-        String requested = "init".equals(segment) ? "init" : null;
-        if (requested == null) {
-            if (!segment.startsWith("t=")) return text(400, "无效 SABR-B 时间段");
+        boolean init = "init".equals(segment);
+        long winStart = -1;
+        String requested = "init";
+        if (!init) {
+            if (!segment.startsWith("t=")) return text(400, "无效微片时间段");
             try {
-                long targetMs = Math.max(0L, Long.parseLong(segment.substring(2)));
-                // B is intentionally time-only. The DASH number belongs to the virtual request
-                // grid, not to the SABR native sequence; feeding it back forces a false one-to-one
-                // mapping and produces video-only 503s when real segment duration changes.
-                requested = "t=" + targetMs;
+                winStart = Math.max(0L, Long.parseLong(segment.substring(2)));
+                requested = "t=" + winStart;
             } catch (Throwable e) {
-                return text(400, "无效 SABR-B 时间段");
+                return text(400, "无效微片时间段");
             }
         }
+        long winMs = data.microSegMs > 0 ? data.microSegMs : microWindowMs();
+        String tag = ("video".equals(track) ? "v" : "a") + "@" + (init ? "init" : winStart);
         // Two attempts: the second one runs against a freshly extracted player response, which is
         // the only way to recover when the server sends RELOAD_PLAYER_RESPONSE (UMP part 46).
         for (int attempt = 0; attempt < 2; attempt++) {
@@ -1284,38 +754,69 @@ final class YTPlay {
                 // using getSegment()'s SABR request/UMP loop. This mirrors googlevideo's
                 // request-driven stream and PipePipe's requestOnce(): the requested t= value is
                 // immediately encoded as player_time_ms, so resume and seek do not queue behind t=0.
-                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 直接请求目标: track=" + track
-                        + ", segment=" + requested + ", hasMedia=" + active.hasMedia());
                 YTSabrSession.Found found = active
                         .getSegment(data.videoItem, data.audioItem, track, requested);
                 if (found == null || found.media == null || found.media.length == 0) {
-                    return text(503, "SABR-B 未产生目标时间媒体");
+                    com.github.catvod.crawler.SpiderDebug.log("YouTube 微片失败 " + tag
+                            + " err=" + (found == null ? "null" : found.error)
+                            + " status=" + active.lastStatus());
+                    return text(503, "微片未产生媒体");
+                }
+                byte[] payload = found.media;
+                if (!init) {
+                    YTSabrSession.Meta meta = found.meta;
+                    if (meta == null) {
+                        com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
+                                + " 无meta 整段交付 " + payload.length + "B");
+                    } else {
+                        long start = Math.max(0L, meta.startMs);
+                        long end = start + Math.max(1L, meta.durationMs);
+                        long owner = ((start + winMs - 1) / winMs) * winMs;
+                        if (owner >= end) {
+                            // Shorter than a window: its owner boundary lies past the segment, so no
+                            // window request could ever resolve to it there. Use the window that
+                            // contains the start instead.
+                            owner = (start / winMs) * winMs;
+                            com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
+                                    + " 分片短于窗口 start=" + start + " dur=" + meta.durationMs
+                                    + " 改用起点窗 " + owner);
+                        }
+                        if (owner == winStart) {
+                            com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
+                                    + " 交付分片 start=" + start + " dur=" + meta.durationMs
+                                    + " 字节=" + payload.length);
+                        } else {
+                            payload = new byte[0];
+                            com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
+                                    + " 空200(分片 start=" + start + " 归属窗 " + owner + ")");
+                        }
+                    }
                 }
                 String contentType = mimeBase(fallback(item.mimeType,
                         "video".equals(track) ? "video/webm" : "audio/webm"));
                 Map<String, String> headers = new LinkedHashMap<>();
                 headers.put("Content-Type", contentType);
-                headers.put("Content-Length", String.valueOf(found.media.length));
+                headers.put("Content-Length", String.valueOf(payload.length));
                 headers.put("Cache-Control", "private, max-age=30");
                 headers.put("Accept-Ranges", "none");
-                return bytes(200, contentType, found.media, headers);
+                return bytes(200, contentType, payload, headers);
             } catch (YTSabrSession.ReloadRequired reload) {
-                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 需重新提取: track=" + track
-                        + ", attempt=" + attempt + ", reason=" + reload.getMessage());
-                if (attempt > 0) return text(503, "SABR-B 需重新提取但重试已用尽");
+                com.github.catvod.crawler.SpiderDebug.log("YouTube 微片需重新提取 " + tag
+                        + " attempt=" + attempt + " reason=" + reload.getMessage());
+                if (attempt > 0) return text(503, "微片需重新提取但重试已用尽");
                 SabrData rebuilt = reextract(vid, quality, cacheKey);
-                if (rebuilt == null) return text(503, "SABR-B 重新提取失败");
+                if (rebuilt == null) return text(503, "微片重新提取失败");
                 data = rebuilt;
                 item = "video".equals(track) ? data.videoItem : data.audioItem;
                 stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+                if (data.microSegMs > 0) winMs = data.microSegMs;
             } catch (Throwable e) {
-                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 取段失败: track=" + track
-                        + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
-                        + ", error=" + String.valueOf(e));
-                return text(503, "SABR-B 取段失败: " + String.valueOf(e));
+                com.github.catvod.crawler.SpiderDebug.log("YouTube 微片取段失败 " + tag
+                        + " status=" + session(stateKey).lastStatus() + " error=" + String.valueOf(e));
+                return text(503, "微片取段失败: " + String.valueOf(e));
             }
         }
-        return text(503, "SABR-B 取段失败");
+        return text(503, "微片取段失败");
     }
 
     /**
@@ -1339,162 +840,11 @@ final class YTPlay {
         return sabrData(vid, quality, cacheKey, true);
     }
 
-    /**
-     * Legacy SegmentBase byte-range endpoint retained for compatibility with old cached MPDs.
-     * New B manifests use {@link #proxySabrTime(Map)} and never depend on sidx/Cues.
-     */
-    private Object[] proxySabrRange(Map<String, String> params) {
-        return text(410, "旧 SABR-B 字节范围桥已停用");
-    }
-
-    private Object[] rangeFromDirect(YTFormat item, Long start, Long end, long indexEnd) {
-        YTFormat.IndexSource source = item.indexSource;
-        String url = source != null && !TextUtils.isEmpty(source.url) ? source.url : item.url;
-        if (TextUtils.isEmpty(url)) return text(404, "缺少索引直链");
-        Map<String, String> headers = new HashMap<>(header);
-        headers.putAll(source != null ? source.headers : item.headers);
-        long begin = start == null ? 0 : start;
-        long upper = end == null ? indexEnd : Math.min(end, indexEnd);
-        YTHttp.Result response = yt.http().get(url, headers, "bytes=" + begin + "-" + upper);
-        if (response.code != 200 && response.code != 206) return text(response.code, "索引取回失败");
-        String contentType = mimeBase(fallback(item.mimeType, "application/octet-stream"));
-        Map<String, String> out = new LinkedHashMap<>();
-        out.put("Content-Type", contentType);
-        out.put("Content-Length", String.valueOf(response.body.length));
-        out.put("Accept-Ranges", "bytes");
-        out.put("Cache-Control", "private, max-age=300");
-        if (response.contentRange != null) out.put("Content-Range", response.contentRange);
-        return bytes(response.code == 206 ? 206 : 200, contentType, response.body, out);
-    }
-
-    /**
-     * Serves one {@code $Number$} segment from the SABR session.
-     *
-     * <p>A 200 response carrying only control parts means the candidate is dead, exactly like an
-     * HTTP failure. For init requests only, switch to the next compatible client rather than
-     * returning 500 and letting the parallel audio/video init requests start a request storm.
-     */
-    private Object[] proxySabr(Map<String, String> params) {
-        String vid = params.get("vid");
-        String quality = params.get("quality") == null ? "best" : params.get("quality");
-        String sid = params.get("sid");
-        String cacheKey = sabrCacheKey(vid, quality, sid, false);
-        String track = params.get("track") == null ? "video" : params.get("track");
-        String segment = params.get("seg") == null ? "init" : params.get("seg");
-        SabrData data = vid == null ? null : sabrCache.get(cacheKey);
-        if (data == null) return text(404, "SABR 缓存不存在");
-        if (!"video".equals(track) && !"audio".equals(track)) return text(400, "无效 SABR 轨道");
-        boolean init = "init".equals(segment);
-        int attempts = 1 + (init ? data.candidates.size() : 0);
-        String lastError = null;
-        boolean rebuilt = false;
-        for (int attempt = 0; attempt < attempts; attempt++) {
-            SabrData current = sabrCache.get(cacheKey);
-            if (current != null) data = current;
-            int requestIndex = data.activeIndex;
-            String stateKey = data.stateKey == null ? vid + ":sabr" : data.stateKey;
-            YTFormat item = "video".equals(track) ? data.videoItem : data.audioItem;
-            try {
-                YTSabrSession.Found found = session(stateKey)
-                        .getSegment(data.videoItem, data.audioItem, track, segment);
-                if (found == null || found.media == null) {
-                    lastError = found == null ? "empty response" : found.error;
-                    if (init && switchClient(vid, requestIndex, cacheKey) != null) continue;
-                    return text(500, "SABR 分段不可用: " + lastError);
-                }
-                SabrData latest = sabrCache.get(cacheKey);
-                if (init && latest != null && latest.activeIndex != requestIndex) continue;
-                String contentType = mimeBase(fallback(item == null ? null : item.mimeType,
-                        "video".equals(track) ? "video/webm" : "audio/webm"));
-                Map<String, String> headers = new LinkedHashMap<>();
-                headers.put("Content-Type", contentType);
-                headers.put("Content-Length", String.valueOf(found.media.length));
-                headers.put("Cache-Control", "private, max-age=30");
-                headers.put("Accept-Ranges", "none");
-                return bytes(200, contentType, found.media, headers);
-            } catch (Throwable e) {
-                lastError = String.valueOf(e);
-                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 取段失败: track=" + track
-                        + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
-                        + ", error=" + lastError);
-                boolean canFailover = init && lastError.contains("SABR HTTP 4");
-                // A stale MPD/session pair is common when the host advances to the next episode
-                // or seeks while parallel init requests are still in flight. Rebuild once for A
-                // before returning an HTTP 500 that makes the host leave the detail page.
-                if (init && !rebuilt && (lastError.contains("IllegalArgumentException")
-                        || lastError.contains("empty") || lastError.contains("SABR"))) {
-                    rebuilt = true;
-                    resetSabr(vid, cacheKey);
-                    SabrData fresh = sabrData(vid, quality, cacheKey, true);
-                    if (fresh != null) {
-                        data = fresh;
-                        attempts = Math.max(attempts, 1 + fresh.candidates.size());
-                        continue;
-                    }
-                }
-                if (!canFailover || switchClient(vid, requestIndex, cacheKey) == null) break;
-            }
-        }
-        return text(500, "SABR 代理失败: " + lastError);
-    }
-
     /* ------------------------------------------------------------------ */
     /* helpers                                                            */
     /* ------------------------------------------------------------------ */
 
-    private YTHttp.Result fetch(YTFormat item, String url, String range) {
-        Map<String, String> headers = new HashMap<>(header);
-        if (item != null) headers.putAll(item.headers);
-        return yt.http().get(url, headers, range);
-    }
-
-    private static Map<String, String> mediaHeaders(String contentType, YTHttp.Result response) {
-        Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", contentType);
-        headers.put("Accept-Ranges", "bytes");
-        headers.put("Cache-Control", "no-cache");
-        if (response.contentRange != null) headers.put("Content-Range", response.contentRange);
-        if (response.contentLength != null) headers.put("Content-Length", response.contentLength);
-        else if (response.body != null) headers.put("Content-Length", String.valueOf(response.body.length));
-        return headers;
-    }
-
-    private static String range(Map<String, String> params) {
-        String value = params.get("range");
-        return value == null ? params.get("Range") : value;
-    }
-
     /** Parses {@code bytes=start-end}; a missing bound is reported as -1. */
-    private static long[] parseRange(String value) {
-        if (value == null || value.isEmpty()) return null;
-        String text = value.trim().toLowerCase(Locale.US);
-        if (text.startsWith("bytes=")) text = text.substring(6);
-        int comma = text.indexOf(',');
-        if (comma >= 0) text = text.substring(0, comma);
-        text = text.trim();
-        int dash = text.indexOf('-');
-        if (dash < 0) return null;
-        long start = -1;
-        long end = -1;
-        String rawStart = text.substring(0, dash).trim();
-        String rawEnd = text.substring(dash + 1).trim();
-        try {
-            if (!rawStart.isEmpty()) start = Long.parseLong(rawStart);
-        } catch (Throwable ignored) {
-            start = -1;
-        }
-        try {
-            if (!rawEnd.isEmpty()) end = Long.parseLong(rawEnd);
-        } catch (Throwable ignored) {
-            end = -1;
-        }
-        return new long[]{start, end};
-    }
-
-    private static String rangeText(long[] range) {
-        if (range == null) return "0-0";
-        return range[0] + "-" + range[1];
-    }
 
     private static String fallback(String value, String other) {
         return TextUtils.isEmpty(value) ? other : value;

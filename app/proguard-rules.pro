@@ -1,40 +1,23 @@
-# Merge
--flattenpackagehierarchy com.github.catvod.spider.merge
+# Repackage
+# Every renamed class MUST land under com.github.catvod.spider: the spider JAR is assembled by
+# copying only smali/com/github/catvod/spider out of the R8 output. -flattenpackagehierarchy keeps
+# distinct package names, and R8 then reuses kept package names (e.g. androidx.tracing) for our own
+# classes, which silently drops them from the JAR -> NoClassDefFoundError at spider init.
+-repackageclasses 'com.github.catvod.spider.merge'
 
 # dontwarn
--dontwarn org.slf4j.**
--dontwarn org.xmlpull.v1.**
--dontwarn com.google.re2j.**
 -dontwarn android.content.res.**
 -dontwarn android.support.annotation.**
 
-# slf4j
--keeppackagenames org.slf4j.**
--keep class org.slf4j.** { *; }
-
 # Android runtime
 -keeppackagenames androidx.annotation.**
--keeppackagenames androidx.startup.**
--keeppackagenames androidx.tracing.**
--keeppackagenames javax.xml.namespace.**
--keeppackagenames org.xmlpull.v1.**
--keep class javax.xml.namespace.** { *; }
--keep class org.xmlpull.v1.** { *; }
-
-# AndroidX
--keep class androidx.core.** { *; }
 
 # Gson
 -keep class com.google.gson.** { *; }
 
-# Kotlin
--keep class kotlin.** { *; }
-
 # Spider
 -keep class com.github.catvod.crawler.* { *; }
--keep class com.github.catvod.spider.** { *; }
--dontwarn android.webkit.**
--keep class com.github.catvod.js.Function { *; }
+-keep class com.github.catvod.spider.* { public <methods>; }
 
 # OkHttp
 -dontwarn okhttp3.**
@@ -42,17 +25,6 @@
 -keep class okio.** { *; }
 -keep class okhttp3.** { *; }
 
-# QuickJS
+# QuickJS — YoutubeNsig reaches it by reflection, so names must survive.
 -keeppackagenames com.whl.quickjs.**
 -keep class com.whl.quickjs.** { *; }
-
-# Sardine
--keeppackagenames com.thegrizzlylabs.sardineandroid.**
--keep class com.thegrizzlylabs.sardineandroid.** { *; }
-
-# SMBJ
--keeppackagenames net.engio.mbassy.**
--keep class com.hierynomus.** { *; }
--keep class net.engio.mbassy.** { *; }
--dontwarn org.ietf.jgss.**
--dontwarn javax.**

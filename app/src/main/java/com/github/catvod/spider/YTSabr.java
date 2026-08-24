@@ -1,6 +1,5 @@
 package com.github.catvod.spider;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -258,7 +257,4 @@ final class YTSabr {
         };
     }
 
-    static List<byte[]> emptyByteList() {
-        return new ArrayList<>();
-    }
 }

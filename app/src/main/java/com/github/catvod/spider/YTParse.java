@@ -3,7 +3,6 @@ package com.github.catvod.spider;
 import android.text.TextUtils;
 import com.github.catvod.bean.Vod;
 import com.github.catvod.crawler.SpiderDebug;
-import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
@@ -598,8 +597,4 @@ final class YTParse {
         return playlist;
     }
 
-    /** Extracts a playlist's {@code contents} array without triggering a full recursive scan. */
-    static JsonArray asArray(JsonElement element) {
-        return element != null && element.isJsonArray() ? element.getAsJsonArray() : new JsonArray();
-    }
 }

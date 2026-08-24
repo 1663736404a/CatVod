@@ -3,9 +3,7 @@ package com.github.catvod.spider;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -39,10 +37,6 @@ class YTFormat {
 
     /* SABR-only state */
     YTSabr.Config sabrConfig;
-    /** Byte ranges of the matching direct representation, used to fetch a real sidx/Cues index. */
-    IndexSource indexSource;
-    /** Segment boundaries parsed from sidx/Cues; empty until {@code loadTimeline} runs. */
-    List<Seg> timeline = new ArrayList<>();
 
     /* view-model extras */
     String trackName;
@@ -82,36 +76,9 @@ class YTFormat {
         c.initRange = initRange;
         c.indexRange = indexRange;
         c.sabrConfig = sabrConfig;
-        c.indexSource = indexSource;
-        c.timeline = timeline;
         c.trackName = trackName;
         c.isHdr = isHdr;
         return c;
-    }
-
-    /** Location of the sidx/Cues index inside a direct progressive URL. */
-    static class IndexSource {
-        String url;
-        Map<String, String> headers = new HashMap<>();
-        long[] initRange;
-        long[] indexRange;
-        String contentLength;
-    }
-
-    /**
-     * One media segment boundary.
-     *
-     * @see YTIndex#parseWebmCues
-     */
-    static class Seg {
-        /** presentation start, ms */
-        long t;
-        /** duration, ms */
-        long d;
-        /** byte offset, or -1 when unknown */
-        long off = -1;
-        /** byte size, or 0 when unknown */
-        long sz;
     }
 
     static long[] range(JsonElement element) {

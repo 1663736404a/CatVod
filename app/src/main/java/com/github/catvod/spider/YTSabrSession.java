@@ -573,25 +573,14 @@ class YTSabrSession {
         if ("audio".equals(track) && dashSegMs < 8000) dashSegMs = 10000;
         if (dashSegMs <= 0) dashSegMs = "video".equals(track) ? 6000 : 10000;
 
-        List<YTFormat.Seg> timeline = trackItem == null ? Collections.emptyList() : trackItem.timeline;
+        // There is no pre-parsed container index any more: the micro-window bridge asks purely by
+        // time and the real boundaries come from MEDIA_HEADER. dashSegMs stays a tolerance hint.
         Long targetMs;
         if (wantInit) {
             targetMs = null;
         } else if (wantTime != null) {
             targetMs = wantTime;
-            // Use the real duration of the segment covering this instant as the tolerance basis.
-            for (YTFormat.Seg entry : timeline) {
-                if (entry.t <= targetMs && targetMs < entry.t + Math.max(1, entry.d)) {
-                    dashSegMs = Math.max(1, entry.d);
-                    break;
-                }
-            }
-        } else if (wantSeq >= 1 && wantSeq <= timeline.size()) {
-            targetMs = timeline.get(wantSeq - 1).t;
-            dashSegMs = Math.max(1, timeline.get(wantSeq - 1).d);
         } else {
-            // Without a real timeline we can only assume equal segments. This disagrees with the
-            // MPD's SegmentTimeline and drifts linearly with playback position.
             targetMs = Math.max(0, (wantSeq - 1) * dashSegMs);
         }
 
@@ -734,50 +723,6 @@ class YTSabrSession {
         Found found = new Found();
         found.media = media;
         return found;
-    }
-
-    /**
-     * Returns the real SABR media boundaries currently present in the session cache.
-     * The result is a copy, sorted by presentation time, so callers can safely use it while
-     * another request later extends the cache.
-     */
-    List<YTFormat.Seg> snapshotTimeline(Integer targetItag) {
-        // Never block the manifest thread on the session lock. The producer holds it for the whole
-        // duration of one SABR pump, which was measured at 6-18s on 2160p, so an unbounded lock()
-        // here stalled the MPD response until the player gave up after 15s and reported a socket
-        // failure. The timeline is only a request-grid hint: returning an empty snapshot makes
-        // timeRows() fall back to the even grid, and the next manifest refresh picks up the real
-        // boundaries once the producer is between pumps.
-        boolean held = false;
-        try {
-            held = lock.tryLock(250L, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
-        if (!held) {
-            SpiderDebug.log("YouTube SABR 时间轴快照跳过(producer 持锁): itag=" + targetItag);
-            return new ArrayList<>();
-        }
-        try {
-            Map<Integer, byte[]> media = segments.get(targetItag);
-            Map<Integer, Meta> metas = segmentMeta.get(targetItag);
-            List<YTFormat.Seg> out = new ArrayList<>();
-            if (media == null || metas == null) return out;
-            for (Map.Entry<Integer, Meta> entry : metas.entrySet()) {
-                if (!media.containsKey(entry.getKey())) continue;
-                Meta meta = entry.getValue();
-                if (meta == null || meta.durationMs <= 0) continue;
-                YTFormat.Seg seg = new YTFormat.Seg();
-                seg.t = Math.max(0, meta.startMs);
-                seg.d = Math.max(1, meta.durationMs);
-                seg.sz = Math.max(0, meta.size);
-                out.add(seg);
-            }
-            out.sort((a, b) -> Long.compare(a.t, b.t));
-            return out;
-        } finally {
-            lock.unlock();
-        }
     }
 
     /* ------------------------------------------------------------------ */

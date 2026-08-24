@@ -171,9 +171,9 @@ public class YouTube extends Spider {
     /**
      * Starts playback through the JAR-owned SABR bridge.
      *
-     * <p>The old implementation returned {@code parse=1} and handed the watch page to the host
-     * WebView. The player now receives a local DASH URL; SegmentBase requests return to
-     * {@link #proxy(Map)}, where {@link YTPlay} performs SABR.
+     * <p>The player receives one local DASH manifest whose segment requests return to
+     * {@link #proxy(Map)}, where {@link YTPlay} answers them from a SABR session using the
+     * micro-window scheme.
      */
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) {
@@ -184,9 +184,6 @@ public class YouTube extends Spider {
         if (at > 0) videoId = rawPid.substring(0, at);
         String quality = YouTubeLite.optString(ext, "quality", "best");
         String sid = String.valueOf(playbackGeneration.incrementAndGet());
-        // YouTube playback is SABR-only here. Keep A (the experimental SegmentTemplate bridge)
-        // and B (the SegmentBase bridge) as explicit choices; do not mix direct URLs into this menu.
-        List<String> urls = new ArrayList<>();
         // The top-level manifest URL deliberately stays on the host's proxy:// scheme. Handing the
         // host a raw http://127.0.0.1 URL makes it classify playback as EXTERNAL_LOOPBACK_PROXY
         // ("evidence=unregistered-loopback-port") and run a blocking readiness probe before every
@@ -196,15 +193,9 @@ public class YouTube extends Spider {
         // Segment URLs inside the manifest are a different matter and do use the JAR-owned server
         // (see YTPlay.localUrl): they are what must survive the host's jar-loader clear, and they
         // are fetched by the player directly without going through that readiness gate.
-        String aParams = "&type=sabr_mpd&vid=" + Uri.encode(videoId)
+        String params = "&type=sabr_mpd&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
-        String bParams = "&type=sabr_mpd2&vid=" + Uri.encode(videoId)
-                + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
-        urls.add("sabr•A");
-        urls.add(Proxy.getUrl(siteKey, aParams));
-        urls.add("sabr•B");
-        urls.add(Proxy.getUrl(siteKey, bParams));
-        return Result.get().url(urls).dash().string();
+        return Result.get().url(Proxy.getUrl(siteKey, params)).dash().string();
     }
 
     @Override
@@ -249,28 +240,6 @@ public class YouTube extends Spider {
             episodes.add(YTParse.safeTitle(item.name == null ? vid : item.name) + "$" + vid);
         }
         return episodes;
-    }
-
-    /** Pulls related videos from the watch page's {@code ytInitialData}. */
-    private List<YTParse.Item> relatedVideos(String videoId) {
-        String page = http.string("https://www.youtube.com/watch?v=" + Uri.encode(videoId));
-        JsonObject data = yt.extractJsonAfter(page, "ytInitialData");
-        if (data == null) return new ArrayList<>();
-        List<YTParse.Item> items = YTParse.items(data, 30);
-        List<YTParse.Item> out = new ArrayList<>();
-        for (YTParse.Item item : items) if (!videoId.equals(item.vodId)) out.add(item);
-        return out;
-    }
-
-    private String videoTitle(String vid) {
-        try {
-            String json = http.string("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v="
-                    + Uri.encode(vid) + "&format=json", null, 1800);
-            JsonObject obj = Json.safeObject(json);
-            return YouTubeLite.optString(obj, "title", vid);
-        } catch (Throwable e) {
-            return vid;
-        }
     }
 
     /* ------------------------------------------------------------------ */

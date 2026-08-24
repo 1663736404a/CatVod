@@ -1,6 +1,5 @@
 package com.github.catvod.spider;
 
-import android.text.TextUtils;
 import android.net.Uri;
 
 /** Holds the TVHTML5 player request identity and integrity condition. */
@@ -24,7 +23,4 @@ final class YoutubePlayer {
         return "https://www.youtube.com/watch?v=" + Uri.encode(videoId);
     }
 
-    static boolean ready(String visitorData, Integer sts, String poToken) {
-        return !TextUtils.isEmpty(visitorData) && sts != null && !TextUtils.isEmpty(poToken);
-    }
 }

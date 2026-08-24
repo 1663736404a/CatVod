@@ -9,7 +9,6 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -57,7 +56,6 @@ class YouTubeLite {
     private static Pattern safePattern(String regex) {
         return safePattern(regex, 0);
     }
-
 
     private static final Pattern RE_VIDEO_ID_URL =
             safePattern("(?:v=|/v/|/embed/|/shorts/|youtu\\.be/)([0-9A-Za-z_-]{11})");
@@ -326,16 +324,6 @@ class YouTubeLite {
         }
     }
 
-    private String extractVisitorData(JsonObject ytcfg, JsonObject playerResponse) {
-        String fromConfig = optString(config, "visitor_data", null);
-        if (fromConfig != null) return fromConfig;
-        String value = optString(ytcfg, "VISITOR_DATA", null);
-        if (value != null) return value;
-        value = traverseString(ytcfg, "INNERTUBE_CONTEXT", "client", "visitorData");
-        if (value != null) return value;
-        return traverseString(playerResponse, "responseContext", "visitorData");
-    }
-
     private Integer extractSignatureTimestamp(String playerUrl) {
         try {
             String code = playerCode(playerUrl);
@@ -353,10 +341,6 @@ class YouTubeLite {
     /* ------------------------------------------------------------------ */
     /* player API                                                         */
     /* ------------------------------------------------------------------ */
-
-    private static JsonObject clientContext(String json) {
-        return Json.safeObject(json);
-    }
 
     private List<JsonObject> callPlayerApi(String videoId, String apiKey, JsonObject webContext,
                                            String referer, String visitorData, Integer sts) {
@@ -494,26 +478,6 @@ class YouTubeLite {
                     }
                 }
             }
-        }
-        // SABR segments share native boundaries with the matching direct representation. Keeping
-        // its WebM Cues / MP4 sidx location lets us build a real SegmentTimeline without
-        // downloading any media.
-        Map<String, YTFormat> directByKey = new HashMap<>();
-        for (YTFormat item : out.formats) {
-            if (item.indexRange == null || TextUtils.isEmpty(item.url)) continue;
-            String key = item.client.toUpperCase(Locale.US) + "|" + item.itag;
-            if (!directByKey.containsKey(key)) directByKey.put(key, item);
-        }
-        for (YTFormat item : out.sabrFormats) {
-            YTFormat direct = directByKey.get(item.client.toUpperCase(Locale.US) + "|" + item.itag);
-            if (direct == null) continue;
-            YTFormat.IndexSource source = new YTFormat.IndexSource();
-            source.url = direct.url;
-            source.headers = new HashMap<>(direct.headers);
-            source.indexRange = direct.indexRange;
-            source.initRange = direct.initRange;
-            source.contentLength = direct.contentLength;
-            item.indexSource = source;
         }
     }
 
