@@ -49,7 +49,6 @@ final class YTPlay {
     // A and B can request the same video MPD concurrently. Serialize extraction per video so
     // both routes share one successful TVHTML5/poToken response instead of racing BotGuard.
     private final Map<String, Object> sabrExtractLocks = new HashMap<>();
-    private final Map<String, Long> refreshMarks = new HashMap<>();
     // A local MPD can outlive the host's current episode during sequential playback.
     // Include a generation in the SABR state key so a new extraction never reuses old UMP state.
     // Static: a Spider rebuilt after the host's registry clear must not restart the counter at 1 and
@@ -150,7 +149,6 @@ final class YTPlay {
             // Do not close the shared HTTP client here: another Spider instance rebuilt after the
             // host's clear may still be serving from a session that uses it.
             sabrCache.clear();
-            playCache.clear();
         }
     }
 
@@ -833,9 +831,6 @@ final class YTPlay {
             yt.invalidateExtract(vid);
         } catch (Throwable ignored) {
             // Best effort: a forced extract below still refreshes most of the state.
-        }
-        synchronized (refreshMarks) {
-            refreshMarks.remove(cacheKey);
         }
         return sabrData(vid, quality, cacheKey, true);
     }
