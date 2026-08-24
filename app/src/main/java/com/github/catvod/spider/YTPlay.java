@@ -541,19 +541,37 @@ final class YTPlay {
                         "video".equals(track) ? "video/webm" : "audio/webm"));
                 byte[] payload = found.media;
                 if (winStart >= 0) {
-                    List<YTIndex.Cluster> units = slicePayload(data, track, found.media);
-                    if (units != null) {
-                        payload = windowClusters(units, winStart, winMs);
-                        String tag = ("video".equals(track) ? "v#" : "a#") + segment;
-                        if (payload.length == 0) {
-                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 空200(数据已随前窗交付)");
-                        } else {
-                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 簇=" + countClusters(units, winStart, winMs)
-                                    + " 字节=" + payload.length + "/" + found.media.length);
-                        }
+                    // Segment-level ownership: a native segment is delivered by the first window
+                    // boundary at or after its start, i.e. owner = ceil(start/win)*win. The window
+                    // request asks for the segment covering its own start, so owner == winStart
+                    // holds for exactly one window per segment (given segment duration > window,
+                    // which makes owner < segment end and therefore reachable). Every other window
+                    // returns a 0-byte 200, which is what keeps the player polling instead of
+                    // waiting out a declared duration whose payload it already consumed.
+                    String tag = ("video".equals(track) ? "v#" : "a#") + segment;
+                    YTSabrSession.Meta meta = found.meta;
+                    if (meta == null) {
+                        SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 无meta 整段交付 "
+                                + payload.length + "B");
                     } else {
-                        SpiderDebug.log("SABR 微片切片失败 track=" + track + " seg=" + segment
-                                + " 回退整段 " + found.media.length + "B(可能有重复数据)");
+                        long start = Math.max(0, meta.startMs);
+                        long end = start + Math.max(1, meta.durationMs);
+                        long owner = ((start + winMs - 1) / winMs) * winMs;
+                        if (owner >= end) {
+                            // Segment shorter than a window: it can never be covered at its own
+                            // owner boundary, so fall back to the window containing its start.
+                            owner = (start / winMs) * winMs;
+                            SpiderDebug.log("SABR 微片 " + tag + " 分片短于窗口 start=" + start
+                                    + " dur=" + meta.durationMs + " 改用起点窗 " + owner);
+                        }
+                        if (owner == winStart) {
+                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 交付分片 start="
+                                    + start + " dur=" + meta.durationMs + " 字节=" + payload.length);
+                        } else {
+                            payload = new byte[0];
+                            SpiderDebug.log("SABR 微片 " + tag + " t=" + winStart + " 空200(分片 start="
+                                    + start + " 归属窗 " + owner + ")");
+                        }
                     }
                 }
                 Map<String, String> headers = new LinkedHashMap<>();
@@ -584,48 +602,12 @@ final class YTPlay {
      *
      * @return the units, or {@code null} when the container is neither or does not parse.
      */
-    private List<YTIndex.Cluster> slicePayload(SabrData data, String track, byte[] media) {
-        String mime = low(mimeBase(fallback(("video".equals(track) ? data.videoItem : data.audioItem) == null
-                ? null : ("video".equals(track) ? data.videoItem : data.audioItem).mimeType, "")));
-        if (mime.contains("webm")) return YTIndex.splitWebmClusters(media);
-        if (mime.contains("mp4")) {
-            try {
-                String stateKey = data.stateKey;
-                YTSabrSession.Found init = session(stateKey)
-                        .getSegment(data.videoItem, data.audioItem, track, "init");
-                if (init == null || init.media == null) return null;
-                return YTIndex.splitMp4Fragments(init.media, media);
-            } catch (Throwable e) {
-                SpiderDebug.log("SABR 微片 init 取回失败 track=" + track + " err=" + e);
-                return null;
-            }
-        }
-        return null;
-    }
+    
 
     /** Concatenates the clusters whose start time falls inside one micro window. */
-    private static byte[] windowClusters(List<YTIndex.Cluster> clusters, long winStart, long winMs) {        int total = 0;
-        for (YTIndex.Cluster cluster : clusters) {
-            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) total += cluster.data.length;
-        }
-        byte[] out = new byte[total];
-        int pos = 0;
-        for (YTIndex.Cluster cluster : clusters) {
-            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) {
-                System.arraycopy(cluster.data, 0, out, pos, cluster.data.length);
-                pos += cluster.data.length;
-            }
-        }
-        return out;
-    }
+    
 
-    private static int countClusters(List<YTIndex.Cluster> clusters, long winStart, long winMs) {
-        int count = 0;
-        for (YTIndex.Cluster cluster : clusters) {
-            if (cluster.ptsMs >= winStart && cluster.ptsMs < winStart + winMs) count++;
-        }
-        return count;
-    }
+    
 
     
 
