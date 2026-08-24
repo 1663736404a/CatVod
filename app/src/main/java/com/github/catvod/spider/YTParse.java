@@ -598,8 +598,4 @@ final class YTParse {
         return playlist;
     }
 
-    /** Extracts a playlist's {@code contents} array without triggering a full recursive scan. */
-    static JsonArray asArray(JsonElement element) {
-        return element != null && element.isJsonArray() ? element.getAsJsonArray() : new JsonArray();
-    }
 }

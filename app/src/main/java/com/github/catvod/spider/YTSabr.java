@@ -245,7 +245,4 @@ final class YTSabr {
         };
     }
 
-    static List<byte[]> emptyByteList() {
-        return new ArrayList<>();
-    }
 }

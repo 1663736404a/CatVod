@@ -184,11 +184,8 @@ public class YouTube extends Spider {
         if (at > 0) videoId = rawPid.substring(0, at);
         String quality = YouTubeLite.optString(ext, "quality", "best");
         // Micro-segment windows keep the player polling through short $Number$ segments, which
-        // avoids stalls where a declared segment outlives its already-exhausted payload. Set
-        // ext.sabr_micro_seg_ms=0 to fall back to the SegmentBase bridge (sabr_mpd2).
-        long microMs = YouTubeLite.optLong(ext, "sabr_micro_seg_ms", 1000);
-        String type = microMs > 0 ? "sabr_mpd" : "sabr_mpd2";
-        String url = Proxy.getUrl(siteKey, "&type=" + type + "&vid=" + Uri.encode(videoId)
+        // avoids stalls where a declared segment outlives its already-exhausted payload.
+        String url = Proxy.getUrl(siteKey, "&type=sabr_mpd&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality));
         return Result.get().url(url).dash().string();
     }

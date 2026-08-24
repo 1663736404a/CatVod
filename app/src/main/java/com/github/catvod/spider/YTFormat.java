@@ -100,8 +100,6 @@ class YTFormat {
 
     /**
      * One media segment boundary.
-     *
-     * @see YTIndex#parseWebmCues
      */
     static class Seg {
         /** presentation start, ms */
