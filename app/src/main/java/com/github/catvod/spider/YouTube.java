@@ -82,18 +82,132 @@ public class YouTube extends Spider {
         this.youtubeProxy = new YoutubeProxy(play);
     }
 
-    /** Loads a standard CatVod class/filter JSON from ext.json. */
+    /**
+     * Loads a standard CatVod class/filter JSON from {@code ext.json}.
+     *
+     * <p>Accepts three source kinds, so a site that filters requests can be bypassed entirely by
+     * downloading the file once and pointing at it locally:
+     * <pre>
+     * "json": "https://host/youtube.json"     // remote, fetched through ext.proxy
+     * "json": "/sdcard/TV/youtube.json"       // local file (also file:// and ./relative)
+     * "json": {"class": [...]}                // inline, no I/O at all
+     * </pre>
+     *
+     * <p>Every failure is logged with its reason. This used to return {@code null} silently, so a
+     * bad path, an unreadable file or a rejected download all looked identical to "not configured"
+     * — the catalog quietly fell back to the built-in list with nothing in the log to explain why.
+     *
+     * @return the parsed catalog, or {@code null} to use the built-in one.
+     */
     private JsonObject readCatalog() {
-        try {
-            JsonElement value = ext.get("json");
-            if (value == null || value.isJsonNull()) return null;
-            String source = value.isJsonPrimitive() ? value.getAsString() : value.toString();
-            String json = source.trim();
-            if (json.startsWith("http://") || json.startsWith("https://")) json = http.string(json);
-            JsonObject root = Json.safeObject(json);
-            return YTExternalCatalog.valid(root) ? root : null;
-        } catch (Throwable ignored) {
+        JsonElement value = ext.get("json");
+        if (value == null || value.isJsonNull()) return null;
+        // An inline object needs no loading.
+        if (value.isJsonObject()) {
+            JsonObject root = value.getAsJsonObject();
+            if (YTExternalCatalog.valid(root)) {
+                SpiderDebug.log("YouTube 外部分类: 使用内联 JSON, 分类数=" + YTExternalCatalog.classes(root).size());
+                return root;
+            }
+            SpiderDebug.log("YouTube 外部分类失败: 内联 JSON 缺少 class 数组");
             return null;
+        }
+        String source = value.isJsonPrimitive() ? value.getAsString().trim() : "";
+        if (source.isEmpty()) {
+            SpiderDebug.log("YouTube 外部分类失败: ext.json 为空");
+            return null;
+        }
+        String json;
+        try {
+            json = catalogSource(source);
+        } catch (Throwable error) {
+            SpiderDebug.log("YouTube 外部分类失败: 读取异常 " + error);
+            return null;
+        }
+        if (json == null || json.trim().isEmpty()) {
+            SpiderDebug.log("YouTube 外部分类失败: 内容为空 " + source);
+            return null;
+        }
+        JsonObject root = Json.safeObject(json);
+        if (!YTExternalCatalog.valid(root)) {
+            // Report what actually arrived: an HTML error page or a WAF challenge is the common
+            // case, and truncating keeps a 39KB body out of the log.
+            String head = json.trim();
+            if (head.length() > 120) head = head.substring(0, 120);
+            SpiderDebug.log("YouTube 外部分类失败: 不是合法分类 JSON(缺少 class 数组), 开头=" + head);
+            return null;
+        }
+        SpiderDebug.log("YouTube 外部分类已加载: " + source
+                + ", 分类数=" + YTExternalCatalog.classes(root).size());
+        return root;
+    }
+
+    /** Resolves {@code ext.json} to raw text, from the network or the filesystem. */
+    private String catalogSource(String source) throws Exception {
+        if (source.startsWith("http://") || source.startsWith("https://")) {
+            // A plain UA is enough for a static file host, but some reject it; the spider's normal
+            // browser headers are already applied by YTHttp.
+            String body = http.string(source, null, 20000L);
+            if (body == null || body.isEmpty()) {
+                SpiderDebug.log("YouTube 外部分类: 远程下载失败或被拒绝 " + source
+                        + "（可下载到本机后改用本地路径）");
+            }
+            return body;
+        }
+        // Inline JSON pasted directly into the value.
+        if (source.startsWith("{")) return source;
+        return readFile(source);
+    }
+
+    /**
+     * Reads a local catalog file.
+     *
+     * <p>{@code file://} URIs, absolute paths and {@code ./relative} paths are all accepted, since
+     * the value is typed by hand. Kept deliberately simple: a JSON catalog is tens of KB.
+     */
+    private static String readFile(String source) throws Exception {
+        String path = source;
+        if (path.startsWith("file://")) path = path.substring(7);
+        // Decode %20 and friends from a path copied out of a file manager.
+        if (path.indexOf('%') >= 0) {
+            try {
+                path = Uri.decode(path);
+            } catch (Throwable ignored) {
+                // Keep the raw path if it was not percent-encoded after all.
+            }
+        }
+        java.io.File file = new java.io.File(path);
+        if (!file.exists()) {
+            SpiderDebug.log("YouTube 外部分类失败: 文件不存在 " + path
+                    + "（确认路径与读取权限，Android 11+ 建议放应用可访问目录）");
+            return null;
+        }
+        if (!file.canRead()) {
+            SpiderDebug.log("YouTube 外部分类失败: 文件无法读取(权限) " + path);
+            return null;
+        }
+        if (file.length() <= 0) {
+            SpiderDebug.log("YouTube 外部分类失败: 文件为空 " + path);
+            return null;
+        }
+        byte[] data = new byte[(int) Math.min(file.length(), 8 * 1024 * 1024L)];
+        java.io.FileInputStream in = new java.io.FileInputStream(file);
+        try {
+            int offset = 0;
+            while (offset < data.length) {
+                int read = in.read(data, offset, data.length - offset);
+                if (read < 0) break;
+                offset += read;
+            }
+            // Strip a UTF-8 BOM, which a Windows-saved file carries and JsonParser rejects.
+            int start = data.length >= 3 && (data[0] & 0xFF) == 0xEF
+                    && (data[1] & 0xFF) == 0xBB && (data[2] & 0xFF) == 0xBF ? 3 : 0;
+            return new String(data, start, offset - start, java.nio.charset.StandardCharsets.UTF_8);
+        } finally {
+            try {
+                in.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
