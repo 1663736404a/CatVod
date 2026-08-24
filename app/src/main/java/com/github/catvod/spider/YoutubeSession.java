@@ -15,8 +15,16 @@ final class YoutubeSession {
     private static final long TOKEN_RETRY_MS = 5000L;
 
     YoutubeSession(android.content.Context context, JsonObject config) {
+        this(context, config, null);
+    }
+
+    /**
+     * @param http the spider's HTTP client, used to run BotGuard's network calls through the
+     *             configured proxy. WebView cannot use it; see {@link YoutubeBotGuard}.
+     */
+    YoutubeSession(android.content.Context context, JsonObject config, YTHttp http) {
         poTokens = new YoutubePoToken(config);
-        botGuard = new YoutubeBotGuard(context, poTokens);
+        botGuard = new YoutubeBotGuard(context, poTokens, http);
     }
 
     void bind(String visitorData, Integer signatureTimestamp) {

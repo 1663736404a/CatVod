@@ -120,7 +120,8 @@ class YouTubeLite {
         this.http = http;
         this.headers = headers == null ? new HashMap<>() : headers;
         this.config = config == null ? new JsonObject() : config;
-        this.session = new YoutubeSession(context, this.config);
+        // Hand the client to the session so BotGuard's fetches share this spider's proxy.
+        this.session = new YoutubeSession(context, this.config, http);
         this.extractCacheTtl = optLong(this.config, "extract_cache_ttl", 300);
     }
 

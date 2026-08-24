@@ -135,6 +135,55 @@ final class YTHttp {
         }
     }
 
+    /** One generic exchange, exposing the status and response headers to the caller. */
+    static final class Exchange {
+        int code;
+        String body = "";
+        final Map<String, String> headers = new HashMap<>();
+    }
+
+    /**
+     * Runs an arbitrary request on this client, so callers that are not OkHttp-aware still go
+     * through the configured proxy. Used by the BotGuard fetch bridge.
+     *
+     * @param method  HTTP method; only GET and POST are used by BotGuard.
+     * @param body    request body, or {@code null} for a bodiless request.
+     * @throws IOException on a transport failure, so the caller can report it verbatim.
+     */
+    Exchange exchange(String method, String url, Map<String, String> headers, String body,
+                      long timeoutMs) throws IOException {
+        if (closed) throw new IOException("Canceled: YouTube spider destroyed");
+        OkHttpClient active = timeoutMs > 0
+                ? client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+                : client;
+        String verb = method == null || method.isEmpty() ? "GET" : method.toUpperCase();
+        Request.Builder builder = request(url, headers);
+        if ("POST".equals(verb) || "PUT".equals(verb) || "PATCH".equals(verb)) {
+            String type = headers == null ? null : headers.get("content-type");
+            if (type == null && headers != null) type = headers.get("Content-Type");
+            MediaType media = null;
+            if (type != null && !type.isEmpty()) {
+                try {
+                    media = MediaType.parse(type);
+                } catch (Throwable ignored) {
+                    // An unparseable content-type falls back to OkHttp's default.
+                }
+            }
+            builder.method(verb, RequestBody.create(body == null ? "" : body, media));
+        } else {
+            builder.method(verb, null);
+        }
+        try (Response response = active.newCall(builder.build()).execute()) {
+            Exchange result = new Exchange();
+            result.code = response.code();
+            result.body = response.body() == null ? "" : response.body().string();
+            for (String name : response.headers().names()) {
+                result.headers.put(name, response.header(name));
+            }
+            return result;
+        }
+    }
+
     String postJson(String url, String json, Map<String, String> headers) throws IOException {
         Map<String, String> merged = new HashMap<>();
         merged.put("Content-Type", "application/json");
