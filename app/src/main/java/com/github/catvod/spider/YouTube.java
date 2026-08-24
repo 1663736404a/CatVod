@@ -44,6 +44,7 @@ public class YouTube extends Spider {
     private YoutubeSession session;
     private YoutubeProxy youtubeProxy;
     private String proxyStr;
+    private JsonObject externalCatalog;
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
     private final Map<String, YTParse.Playlist> playlistCache = new HashMap<>();
@@ -70,10 +71,26 @@ public class YouTube extends Spider {
         header.put("Referer", "https://www.youtube.com/");
         this.proxyStr = readProxy();
         this.http = new YTHttp(header, proxyStr);
+        this.externalCatalog = readCatalog();
         this.yt = new YouTubeLite(context, http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
         this.session = new YoutubeSession(context, ext);
         this.youtubeProxy = new YoutubeProxy(play);
+    }
+
+    /** Loads a standard CatVod class/filter JSON from ext.json. */
+    private JsonObject readCatalog() {
+        try {
+            JsonElement value = ext.get("json");
+            if (value == null || value.isJsonNull()) return null;
+            String source = value.isJsonPrimitive() ? value.getAsString() : value.toString();
+            String json = source.trim();
+            if (json.startsWith("http://") || json.startsWith("https://")) json = http.string(json);
+            JsonObject root = Json.safeObject(json);
+            return YTExternalCatalog.valid(root) ? root : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     /** Reads the {@code proxy} extend value, accepting either a bare host:port or an object. */
@@ -93,9 +110,10 @@ public class YouTube extends Spider {
 
     @Override
     public String homeContent(boolean filter) {
-        List<Class> classes = YTCatalog.classes();
+        List<Class> classes = externalCatalog == null ? YTCatalog.classes() : YTExternalCatalog.classes(externalCatalog);
         if (!filter) return Result.string(classes, new ArrayList<>());
-        LinkedHashMap<String, List<Filter>> filters = YTCatalog.filters();
+        LinkedHashMap<String, List<Filter>> filters = externalCatalog == null
+                ? YTCatalog.filters() : YTExternalCatalog.filters(externalCatalog);
         return Result.string(classes, filters);
     }
 
@@ -107,7 +125,9 @@ public class YouTube extends Spider {
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
         int page = parsePage(pg);
-        String query = YTCatalog.keyword(tid, extend);
+        String query = externalCatalog == null
+                ? YTCatalog.keyword(tid, extend)
+                : YTExternalCatalog.keyword(externalCatalog, tid, extend);
         List<YTParse.Item> items = searchPage(query, page);
         boolean hasMore = hasMore(query, page);
         return list(items, page, hasMore);
