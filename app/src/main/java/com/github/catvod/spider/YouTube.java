@@ -486,8 +486,22 @@ public class YouTube extends Spider {
     public Object[] proxy(Map<String, String> params) {
         // Thumbnails are answered here rather than in YTPlay: they are unrelated to a playback
         // session, so a poster must still load when no video is playing.
-        if (params != null && "img".equals(params.get("type"))) return YTImage.serve(http, params);
-        return youtubeProxy == null ? null : youtubeProxy.handle(params);
+        Object[] result = params != null && "img".equals(params.get("type"))
+                ? YTImage.serve(http, params)
+                : (youtubeProxy == null ? null : youtubeProxy.handle(params));
+        // Single choke point for the status code. The host maps it onto NanoHTTPD's Status enum and
+        // an unrepresentable value (502/504 among others) becomes null, which does not fail the
+        // request — it throws java.lang.Error inside the host's response writer and takes the app
+        // down. Sanitising here means no future route can reintroduce that crash.
+        if (result != null && result.length > 0 && result[0] instanceof Integer) {
+            int code = (Integer) result[0];
+            int safe = YTImage.safeCode(code);
+            if (safe != code) {
+                SpiderDebug.log("YouTube proxy 状态码 " + code + " 宿主不支持, 已改为 " + safe);
+                result[0] = safe;
+            }
+        }
+        return result;
     }
 
     @Override

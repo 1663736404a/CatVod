@@ -81,7 +81,10 @@ final class YTImage {
             byte[] body = result.body == null ? new byte[0] : result.body;
             if (result.code < 200 || result.code >= 300 || body.length == 0) {
                 SpiderDebug.log("YouTube 图片代理失败: code=" + result.code + " bytes=" + body.length);
-                return error(502, "image fetch failed");
+                // Must not be 502: the host maps this code onto NanoHTTPD's Status enum, which has
+                // no 502 entry, so the lookup yields null and sendResponse() throws
+                // "Status can't be null." — crashing the host while the poster grid loads.
+                return error(500, "image fetch failed");
             }
             if (body.length > MAX_BYTES) {
                 SpiderDebug.log("YouTube 图片过大已拒绝: bytes=" + body.length);
@@ -93,7 +96,7 @@ final class YTImage {
             // Posters are immutable for a given signed URL, so let the host cache them.
             extra.put("Cache-Control", "public, max-age=86400");
             extra.put("Content-Length", String.valueOf(body.length));
-            return new Object[]{200, type, new ByteArrayInputStream(body), extra};
+            return new Object[]{safeCode(200), type, new ByteArrayInputStream(body), extra};
         } finally {
             result.close();
         }
@@ -109,8 +112,35 @@ final class YTImage {
         return "image/jpeg";
     }
 
+    /**
+     * Status codes NanoHTTPD (the host's HTTP server) can represent.
+     *
+     * <p>Anything the host cannot map becomes {@code null} inside its response builder and takes the
+     * whole app down with {@code java.lang.Error: sendResponse(): Status can't be null.} rather than
+     * failing the one request. Returning a code from this set is therefore a hard requirement for
+     * every value handed back through {@code Spider.proxy}. Notably absent: 502 and 504.
+     */
+    private static final int[] HOST_CODES = {
+            101, 200, 201, 202, 204, 206, 207,
+            301, 302, 303, 304, 307,
+            400, 401, 403, 404, 405, 406, 408, 409, 410, 411, 412, 413, 415, 416, 417, 429,
+            500, 501, 503, 505};
+
+    /** Maps any code onto one the host can send, so a bad value cannot crash it. */
+    static int safeCode(int code) {
+        for (int candidate : HOST_CODES) {
+            if (candidate == code) return code;
+        }
+        // Collapse to the nearest representable class rather than guessing a specific code.
+        if (code >= 500) return 500;
+        if (code >= 400) return 400;
+        if (code >= 300) return 302;
+        if (code >= 200) return 200;
+        return 500;
+    }
+
     private static Object[] error(int code, String message) {
-        return new Object[]{code, "text/plain; charset=utf-8",
+        return new Object[]{safeCode(code), "text/plain; charset=utf-8",
                 new ByteArrayInputStream(message.getBytes(java.nio.charset.StandardCharsets.UTF_8))};
     }
 
