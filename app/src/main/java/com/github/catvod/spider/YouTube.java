@@ -48,6 +48,8 @@ public class YouTube extends Spider {
     /** Whether {@code vod_pic} is rewritten through this spider; see {@link YTImage}. */
     private boolean proxyImage;
     private JsonObject externalCatalog;
+    /** True once the catalog has been loaded; a failed attempt leaves it false so it is retried. */
+    private volatile boolean catalogLoaded;
 
     private final Map<String, SearchSession> searchCache = new HashMap<>();
     private final Map<String, YTParse.Playlist> playlistCache = new HashMap<>();
@@ -75,11 +77,50 @@ public class YouTube extends Spider {
         this.proxyStr = readProxy();
         this.http = new YTHttp(header, proxyStr);
         this.proxyImage = readProxyImage();
-        this.externalCatalog = readCatalog();
+        // Deliberately not loaded here; see catalog(). init() can run before the host's local file
+        // service is listening, and a failure at that instant must not become permanent.
+        this.externalCatalog = null;
+        this.catalogLoaded = false;
         this.yt = new YouTubeLite(context, http, header, ext);
         this.play = new YTPlay(yt, header, ext, siteKey);
         this.session = new YoutubeSession(context, ext);
         this.youtubeProxy = new YoutubeProxy(play);
+    }
+
+    /**
+     * The external catalog, loaded on first use and retried until it succeeds.
+     *
+     * <p>Loading in {@code init()} was wrong. The host constructs the Spider as part of rebuilding
+     * the catalog, and when {@code ext.json} points at a local file the host serves it from its own
+     * {@code 127.0.0.1:9978/file/...} endpoint — which may not be listening yet at that instant, and
+     * for a remote URL the proxy may not be up either. A miss then stuck: {@code externalCatalog}
+     * stayed null for the Spider's whole lifetime, so the built-in list was used until the user
+     * refreshed or switched sites to force a rebuild. Configuring {@code ext.json} should simply
+     * mean the external catalog is used.
+     *
+     * <p>So the attempt is deferred to the first request that needs it and repeated while it keeps
+     * failing. Success is latched, so the normal case is still exactly one load.
+     */
+    private JsonObject catalog() {
+        if (catalogLoaded) return externalCatalog;
+        synchronized (this) {
+            if (catalogLoaded) return externalCatalog;
+            // Nothing configured: latch immediately, the built-in catalog is the intended answer.
+            JsonElement value = ext == null ? null : ext.get("json");
+            if (value == null || value.isJsonNull()) {
+                catalogLoaded = true;
+                return null;
+            }
+            JsonObject loaded = readCatalog();
+            if (loaded != null) {
+                externalCatalog = loaded;
+                catalogLoaded = true;
+                return externalCatalog;
+            }
+            // Leave catalogLoaded false so the next request tries again.
+            SpiderDebug.log("YouTube 外部分类: 本次未取到，下次请求将重试（暂用内置分类）");
+            return null;
+        }
     }
 
     /**
@@ -148,6 +189,24 @@ public class YouTube extends Spider {
             // A plain UA is enough for a static file host, but some reject it; the spider's normal
             // browser headers are already applied by YTHttp.
             String body = http.string(source, null, 20000L);
+            // Choosing a local directory makes the host serve the file from its own loopback
+            // endpoint (127.0.0.1:9978/file/...), which can lose a race against this request during
+            // a catalog rebuild. That is a startup race, not a rejection, so retry briefly rather
+            // than falling back to the built-in catalog for a file that is sitting on disk.
+            if ((body == null || body.isEmpty()) && loopback(source)) {
+                for (int attempt = 0; attempt < 3 && (body == null || body.isEmpty()); attempt++) {
+                    try {
+                        Thread.sleep(300L);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    body = http.string(source, null, 20000L);
+                }
+                if (body != null && !body.isEmpty()) {
+                    SpiderDebug.log("YouTube 外部分类: 本机服务重试后取到 " + source);
+                }
+            }
             if (body == null || body.isEmpty()) {
                 SpiderDebug.log("YouTube 外部分类: 远程下载失败或被拒绝 " + source
                         + "（可下载到本机后改用本地路径）");
@@ -157,6 +216,11 @@ public class YouTube extends Spider {
         // Inline JSON pasted directly into the value.
         if (source.startsWith("{")) return source;
         return readFile(source);
+    }
+
+    /** True for a URL served by this device, where a failure is likely a startup race. */
+    private static boolean loopback(String url) {
+        return url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]");
     }
 
     /**
@@ -308,10 +372,11 @@ public class YouTube extends Spider {
 
     @Override
     public String homeContent(boolean filter) {
-        List<Class> classes = externalCatalog == null ? YTCatalog.classes() : YTExternalCatalog.classes(externalCatalog);
+        JsonObject external = catalog();
+        List<Class> classes = external == null ? YTCatalog.classes() : YTExternalCatalog.classes(external);
         if (!filter) return Result.string(classes, new ArrayList<>());
-        LinkedHashMap<String, List<Filter>> filters = externalCatalog == null
-                ? YTCatalog.filters() : YTExternalCatalog.filters(externalCatalog);
+        LinkedHashMap<String, List<Filter>> filters = external == null
+                ? YTCatalog.filters() : YTExternalCatalog.filters(external);
         return Result.string(classes, filters);
     }
 
@@ -323,9 +388,10 @@ public class YouTube extends Spider {
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
         int page = parsePage(pg);
-        String query = externalCatalog == null
+        JsonObject external = catalog();
+        String query = external == null
                 ? YTCatalog.keyword(tid, extend)
-                : YTExternalCatalog.keyword(externalCatalog, tid, extend);
+                : YTExternalCatalog.keyword(external, tid, extend);
         List<YTParse.Item> items = searchPage(query, page);
         boolean hasMore = hasMore(query, page);
         return list(items, page, hasMore);
