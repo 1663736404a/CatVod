@@ -1,8 +1,5 @@
 package com.github.catvod.utils;
 
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
 
 import com.github.catvod.spider.Init;
 
@@ -72,9 +69,4 @@ public class Util {
         return "";
     }
 
-    public static void copy(String text) {
-        ClipboardManager manager = (ClipboardManager) Init.context().getSystemService(Context.CLIPBOARD_SERVICE);
-        manager.setPrimaryClip(ClipData.newPlainText("fongmi", text));
-        Notify.show("已複製 " + text);
-    }
 }
