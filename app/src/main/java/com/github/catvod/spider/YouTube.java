@@ -93,19 +93,44 @@ public class YouTube extends Spider {
         }
     }
 
-    /** Reads the {@code proxy} extend value, accepting either a bare host:port or an object. */
+    /**
+     * Reads an explicit proxy, otherwise uses a listening common local HTTP/Mixed proxy.
+     * Clash, Hiddify and the two known local proxy services are covered by default.
+     */
     private String readProxy() {
         JsonElement value = ext.get("proxy");
-        if (value == null || value.isJsonNull()) return null;
-        String text = "";
-        if (value.isJsonPrimitive()) {
-            text = value.getAsString();
-        } else if (value.isJsonObject()) {
-            JsonObject obj = value.getAsJsonObject();
-            text = YouTubeLite.optString(obj, "http", YouTubeLite.optString(obj, "https", ""));
+        if (value != null && !value.isJsonNull()) {
+            String text = "";
+            if (value.isJsonPrimitive()) {
+                text = value.getAsString();
+            } else if (value.isJsonObject()) {
+                JsonObject obj = value.getAsJsonObject();
+                text = YouTubeLite.optString(obj, "http", YouTubeLite.optString(obj, "https", ""));
+            }
+            text = normalizeProxy(text);
+            return text.isEmpty() ? null : text;
         }
-        text = text.replace("http://", "").replace("https://", "").trim();
-        return text.isEmpty() ? null : text;
+        for (int port : new int[]{7890, 12334, 10172, 9966}) {
+            String candidate = "127.0.0.1:" + port;
+            if (isListening(port)) {
+                com.github.catvod.crawler.SpiderDebug.log("YouTube 自动使用本机代理: " + candidate);
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static String normalizeProxy(String text) {
+        return text == null ? "" : text.replace("http://", "").replace("https://", "").trim();
+    }
+
+    private static boolean isListening(int port) {
+        try (java.net.Socket socket = new java.net.Socket()) {
+            socket.connect(new java.net.InetSocketAddress("127.0.0.1", port), 200);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     @Override

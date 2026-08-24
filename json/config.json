@@ -10,8 +10,7 @@
       "filterable": 1,
       "changeable": 0,
       "ext": {
-        "json": "https://www.252035.xyz/p/lib/youtube.json",
-        "proxy": "127.0.0.1:10172"
+        "json": "https://www.252035.xyz/p/lib/youtube.json"
       }
     }
   ]
