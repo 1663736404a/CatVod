@@ -1204,7 +1204,7 @@ class YouTubeLite {
 
     static String compactLog(String value) {
         if (value == null || value.isEmpty()) return "-";
-        return value.replace('\\n', ' ').replace('\\r', ' ').replace(',', ';');
+        return value.replace('\n', ' ').replace('\r', ' ').replace(',', ';');
     }
 
 
