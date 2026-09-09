@@ -6,9 +6,9 @@ import com.github.catvod.crawler.SpiderDebug;
 import com.github.catvod.utils.Json;
 import com.github.catvod.utils.Notify;
 import com.github.catvod.utils.Prefers;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
-import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -38,14 +38,15 @@ final class YoutubeOAuth {
     private static final String TV_PAGE = "https://www.youtube.com/tv";
     private static final String DEVICE_URL = "https://www.youtube.com/o/oauth2/device/code";
     private static final String TOKEN_URL = "https://www.youtube.com/o/oauth2/token";
-    private static final String TV_BOOTSTRAP =
-            "https://www.youtube.com/youtubei/v1/tv?prettyPrint=false";
-    private static final String ACCOUNT_LIST =
-            "https://www.youtube.com/youtubei/v1/account/accounts_list?prettyPrint=false";
     private static final String SCOPE = "https://www.googleapis.com/auth/youtube";
     /** The device flow uses this URL-shaped grant type rather than the usual {@code urn:} form. */
     private static final String GRANT_DEVICE = "http://oauth.net/grant_type/device/1.0";
     private static final String GRANT_REFRESH = "refresh_token";
+    /** pg.jar R.g.p: the TV OAuth session probe posts accounts_list, never /youtubei/v1/tv. */
+    private static final String ACCOUNT_LIST =
+            "https://www.youtube.com/youtubei/v1/account/accounts_list?prettyPrint=false";
+    /** pg.jar uses two Cobalt identities: this plain one for the TV page fetch and accounts_list. */
+    private static final String TV_SIMPLE_UA = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
 
     /**
      * Credentials of YouTube's own TV client, used as a fallback when they cannot be read from the
@@ -62,8 +63,9 @@ final class YoutubeOAuth {
     private static final String KEY_VISITOR_AT = "yt_oauth_visitor_at";
     /** pg.jar persists the TV account page id and sends it as X-Goog-Pageid. */
     private static final String KEY_PAGE_ID = "yt_oauth_page_id";
-    /** Cookies from the authenticated TV session must follow subsequent player calls. */
-    private static final String KEY_COOKIES = "yt_oauth_cookies";
+    /** Live TVHTML5 client version scraped from the /tv page, pg.jar R.G.d. */
+    private static final String KEY_TV_CVER = "yt_oauth_tv_cver";
+    private static final String KEY_TV_CVER_AT = "yt_oauth_tv_cver_at";
 
     /** Refresh this far before the server-declared expiry so no request races the boundary. */
     private static final long REFRESH_MARGIN_MS = 300000L;
@@ -73,7 +75,11 @@ final class YoutubeOAuth {
             Pattern.compile("clientId\\s*:\\s*\"([\\w-]+\\.apps\\.googleusercontent\\.com)\"");
     private static final Pattern RE_CLIENT_SECRET = Pattern.compile("clientSecret\\s*:\\s*\"([\\w-]+)\"");
     private static final Pattern RE_JS = Pattern.compile("\"(/s/(?:tv|player)/[^\"]+?\\.js)\"");
-    private static final Pattern RE_VISITOR_COOKIE = Pattern.compile("_____([\\w%\\-=]{16,})");
+    /** pg.jar R.G.c: the TV page carries the current TVHTML5 version in this ytcfg entry. */
+    private static final Pattern RE_TV_CVER = Pattern.compile("INNERTUBE_CLIENT_VERSION\":\"([0-9.]+)\"");
+    /** pg.jar R.G.b caches the scraped client version for six hours. */
+    private static final long TV_CVER_TTL_MS = 21600000L;
+    private static final String TV_CVER_FALLBACK = "7.20260707.07.00";
 
     /** In-memory mirror, and the only store when {@code Init.context()} is unavailable. */
     private static final Map<String, String> MEMORY = new HashMap<>();
@@ -81,6 +87,7 @@ final class YoutubeOAuth {
     private static volatile YTHttp http;
     private static volatile String clientId;
     private static volatile String clientSecret;
+    private static volatile String cachedTvCver;
     private static volatile Device pending;
     private static volatile Thread poller;
     private static final Object TOKEN_LOCK = new Object();
@@ -157,7 +164,6 @@ final class YoutubeOAuth {
             write(KEY_VISITOR, "");
             write(KEY_VISITOR_AT, "");
             write(KEY_PAGE_ID, "");
-            write(KEY_COOKIES, "");
         }
         pending = null;
         SpiderDebug.log("YouTube OAuth 已退出登录");
@@ -187,16 +193,25 @@ final class YoutubeOAuth {
      *         A stored refresh token alone is not proof that the current request is authenticated.
      */
     static boolean apply(Map<String, String> headers) {
+        return apply(headers, null);
+    }
+
+    /**
+     * @param url the endpoint this header set is for; pg.jar R.F.b reserves the {@code /tv}
+     *            referer for player requests and sends the plain site referer elsewhere.
+     */
+    static boolean apply(Map<String, String> headers, String url) {
         if (headers == null) return false;
         String access = token();
         if (TextUtils.isEmpty(access)) return false;
+        // pg.jar R.F.b OAuth branch: exactly these headers, no Cookie and no X-Goog-Visitor-Id;
+        // the account identity travels in the Bearer token and the page id alone.
         headers.put("Authorization", "Bearer " + access);
         headers.put("X-Goog-AuthUser", "0");
         String pageId = read(KEY_PAGE_ID);
         if (!TextUtils.isEmpty(pageId)) headers.put("X-Goog-Pageid", pageId);
-        String cookies = read(KEY_COOKIES);
-        if (!TextUtils.isEmpty(cookies)) headers.put("Cookie", cookies);
-        headers.put("Referer", TV_PAGE);
+        headers.put("Referer", url != null && url.contains("youtubei/v1/player")
+                ? TV_PAGE : "https://www.youtube.com/");
         headers.put("Origin", "https://www.youtube.com");
         return true;
     }
@@ -390,104 +405,94 @@ final class YoutubeOAuth {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Asks the TV endpoint for a session as the signed-in account.
+     * Probes the signed-in TV session with accounts_list, pg.jar R.g.p's shape verbatim.
      *
-     * <p>The visitor id arrives either in {@code responseContext} or inside the {@code _____} block
-     * of a {@code Set-Cookie} value, depending on the endpoint's mood; both are accepted.
+     * <p>pg.jar never posts {@code /youtubei/v1/tv} on the OAuth line. The TV session identity —
+     * the visitor id and the account page id — comes from the accounts_list response context, and
+     * the request presents the same TVHTML5 identity the player request will use later (client id
+     * 7, Cobalt user agent, TV body context), so the session and the player request stay coherent.
      */
     private static String bootstrap() {
         String access = token();
         if (TextUtils.isEmpty(access)) return null;
         JsonObject client = new JsonObject();
-        client.addProperty("clientName", YoutubePlayer.CLIENT);
-        client.addProperty("clientVersion", YoutubePlayer.DEFAULT_VERSION);
-        client.addProperty("userAgent", YoutubePlayer.DEFAULT_UA);
+        client.addProperty("clientName", "TVHTML5");
+        client.addProperty("clientVersion", tvClientVersion());
+        client.addProperty("clientScreen", "WATCH");
+        client.addProperty("platform", "TV");
         client.addProperty("hl", "en");
         client.addProperty("gl", "US");
+        client.addProperty("userAgent", TV_SIMPLE_UA);
+        JsonObject tvAppInfo = new JsonObject();
+        tvAppInfo.addProperty("appQuality", "TV_APP_QUALITY_LIMITED_ANIMATION");
+        tvAppInfo.addProperty("zylonLeftNav", 1);
+        client.add("tvAppInfo", tvAppInfo);
+        JsonObject request = new JsonObject();
+        request.add("internalExperimentFlags", new JsonArray());
+        request.addProperty("useSsl", 1);
+        JsonObject user = new JsonObject();
+        user.addProperty("lockedSafetyMode", 0);
         JsonObject context = new JsonObject();
         context.add("client", client);
+        context.add("request", request);
+        context.add("user", user);
         JsonObject payload = new JsonObject();
         payload.add("context", context);
-        Map<String, String> headers = tvHeaders();
-        // 7 is the Cobalt streamer id used inside SABR protobufs; the InnerTube
-        // TVHTML5 HTTP header is client id 85.
-        headers.put("X-YouTube-Client-Name", "85");
-        headers.put("X-YouTube-Client-Version", YoutubePlayer.DEFAULT_VERSION);
-        headers.put("User-Agent", YTSabr.cobaltUserAgent());
-        apply(headers);
-        YTHttp.Text response = http().postJsonText(TV_BOOTSTRAP, payload.toString(), headers);
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Origin", "https://www.youtube.com");
+        // pg.jar R.g.p: the accounts_list probe identifies as client 7 with the plain Cobalt
+        // user agent, never as the 85 embed id.
+        headers.put("X-YouTube-Client-Name", "7");
+        headers.put("X-YouTube-Client-Version", tvClientVersion());
+        headers.put("User-Agent", TV_SIMPLE_UA);
+        if (!apply(headers, ACCOUNT_LIST)) return null;
+        YTHttp.Text response = http().postJsonText(ACCOUNT_LIST, payload.toString(), headers);
         if (response == null) return null;
         JsonObject body = Json.safeObject(response.body);
-        String fromJson = YouTubeLite.traverseString(body, "responseContext", "visitorData");
-        // pg.jar extracts pageId/account metadata from accounts_list and persists it for
-        // X-Goog-Pageid on every authenticated player request.
-        String pageId = YouTubeLite.traverseString(body, "pageId");
-        if (TextUtils.isEmpty(pageId)) pageId = findJsonString(response.body, "pageId");
+        String visitor = YouTubeLite.traverseString(body, "responseContext", "visitorData");
+        String pageId = findJsonString(response.body, "pageId");
         if (!TextUtils.isEmpty(pageId)) write(KEY_PAGE_ID, pageId);
-        if (!response.cookies.isEmpty()) {
-            String joined = joinCookies(response.cookies);
-            if (!TextUtils.isEmpty(joined)) write(KEY_COOKIES, joined);
-        }
-        // pg.jar performs an accounts_list probe as part of the OAuth TV session health check.
-        // Its response is where pageId is normally returned; do this even when /tv already gave
-        // visitorData so the subsequent player request has the complete authentication context.
-        fetchAccountMeta();
-        if (YoutubeVisitor.usable(fromJson)) return fromJson;
-        for (String cookie : response.cookies) {
-            Matcher matcher = RE_VISITOR_COOKIE.matcher(cookie == null ? "" : cookie);
-            if (!matcher.find()) continue;
-            String value = decode(matcher.group(1));
-            if (YoutubeVisitor.usable(value)) return value;
-        }
-        return null;
+        SpiderDebug.log("YouTube OAuth TV accounts_list 会话探测: http=" + response.code
+                + ", visitor=" + YoutubeVisitor.usable(visitor)
+                + ", pageId=" + !TextUtils.isEmpty(pageId));
+        return YoutubeVisitor.usable(visitor) ? visitor : null;
     }
 
-    private static void fetchAccountMeta() {
+    /**
+     * The live TVHTML5 client version, pg.jar R.G.d's flow: cached six hours, scraped from the
+     * {@code /tv} page with the plain Cobalt identity, a stale cache preferred over the constant
+     * fallback when the page cannot be fetched.
+     */
+    static String tvClientVersion() {
+        String cached = cachedTvCver;
+        if (!TextUtils.isEmpty(cached)) return cached;
+        long fetchedAt = readLong(KEY_TV_CVER_AT);
+        String stored = read(KEY_TV_CVER);
+        if (!TextUtils.isEmpty(stored) && System.currentTimeMillis() - fetchedAt < TV_CVER_TTL_MS) {
+            cachedTvCver = stored;
+            return stored;
+        }
         try {
-            JsonObject payload = new JsonObject();
-            JsonObject context = new JsonObject();
-            JsonObject client = new JsonObject();
-            client.addProperty("clientName", "WEB");
-            client.addProperty("clientVersion", YoutubePlayer.DEFAULT_VERSION);
-            context.add("client", client);
-            Map<String, String> headers = tvHeaders();
-            // 7 belongs to the Cobalt SABR streamer context, not this HTTP request.
-            headers.put("X-YouTube-Client-Name", "85");
-            headers.put("X-YouTube-Client-Version", YTSabr.cobaltVersion());
-            headers.put("User-Agent", "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version");
-            if (!apply(headers)) return;
-            YTHttp.Text result = http().postJsonText(ACCOUNT_LIST, payload.toString(), headers);
-            if (result == null || result.code < 200 || result.code >= 300) return;
-            if (!result.cookies.isEmpty()) {
-                String joined = joinCookies(result.cookies);
-                if (!TextUtils.isEmpty(joined)) write(KEY_COOKIES, joined);
+            Map<String, String> headers = new HashMap<>();
+            headers.put("User-Agent", TV_SIMPLE_UA);
+            headers.put("Accept-Language", "en-US,en;q=0.9");
+            String page = http().string(TV_PAGE, headers);
+            Matcher matcher = RE_TV_CVER.matcher(page == null ? "" : page);
+            if (matcher.find() && !TextUtils.isEmpty(matcher.group(1))) {
+                String version = matcher.group(1);
+                cachedTvCver = version;
+                write(KEY_TV_CVER, version);
+                write(KEY_TV_CVER_AT, String.valueOf(System.currentTimeMillis()));
+                return version;
             }
-            String pageId = findJsonString(result.body, "pageId");
-            if (!TextUtils.isEmpty(pageId)) write(KEY_PAGE_ID, pageId);
-            String visitor = YouTubeLite.traverseString(Json.safeObject(result.body),
-                    "responseContext", "visitorData");
-            if (YoutubeVisitor.usable(visitor)) {
-                write(KEY_VISITOR, visitor);
-                write(KEY_VISITOR_AT, String.valueOf(System.currentTimeMillis()));
-            }
-            SpiderDebug.log("YouTube OAuth TV accounts_list 会话探测成功: pageId="
-                    + (!TextUtils.isEmpty(pageId)) + ", visitor=" + (YoutubeVisitor.usable(visitor)));
         } catch (Throwable e) {
-            SpiderDebug.log("YouTube OAuth TV accounts_list 探测失败: " + e.getClass().getSimpleName());
+            SpiderDebug.log("YouTube OAuth TV 版本抓取失败: " + e.getClass().getSimpleName());
         }
-    }
-
-    private static String joinCookies(List<String> cookies) {
-        StringBuilder out = new StringBuilder();
-        for (String raw : cookies) {
-            if (TextUtils.isEmpty(raw)) continue;
-            String first = raw;
-            int semi = first.indexOf(';');
-            if (semi >= 0) first = first.substring(0, semi);
-            if (out.length() > 0) out.append("; ");
-            out.append(first);
+        if (!TextUtils.isEmpty(stored)) {
+            cachedTvCver = stored;
+            return stored;
         }
-        return out.toString();
+        return TV_CVER_FALLBACK;
     }
 
     private static String findJsonString(String body, String key) {
@@ -502,14 +507,6 @@ final class YoutubeOAuth {
             return q1 >= 0 && q2 > q1 ? body.substring(q1 + 1, q2) : "";
         } catch (Throwable ignored) {
             return "";
-        }
-    }
-
-    private static String decode(String value) {
-        try {
-            return URLDecoder.decode(value, "UTF-8");
-        } catch (Throwable e) {
-            return value;
         }
     }
 

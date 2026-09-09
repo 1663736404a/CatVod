@@ -345,6 +345,29 @@ class YouTubeLite {
         }
     }
 
+    /**
+     * pg.jar parses the browser name and version out of the user agent the client declares, in
+     * this probe order, and reports them as browserName/browserVersion in the TV client context.
+     */
+    private static String[] browserFromUserAgent(String ua) {
+        if (TextUtils.isEmpty(ua)) return null;
+        String[] probes = {"SamsungBrowser", "LG Browser", "Cobalt", "Chrome", "Safari"};
+        for (String probe : probes) {
+            Matcher matcher = Pattern.compile(Pattern.quote(probe) + "/([a-zA-Z0-9.-]+)").matcher(ua);
+            if (matcher.find()) return new String[]{probe, matcher.group(1)};
+        }
+        return null;
+    }
+
+    /** A content playback nonce: sixteen random base64url characters, as real clients send. */
+    private static String randomCpn() {
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        java.util.Random random = new java.util.Random();
+        StringBuilder out = new StringBuilder(16);
+        for (int i = 0; i < 16; i++) out.append(alphabet.charAt(random.nextInt(alphabet.length())));
+        return out.toString();
+    }
+
     private String extractVisitorData(JsonObject ytcfg, JsonObject playerResponse) {
         String fromConfig = optString(config, "visitor_data", null);
         if (fromConfig != null) return fromConfig;
@@ -402,6 +425,20 @@ class YouTubeLite {
             ua = YTSabr.cobaltUserAgent();
             tvClient.addProperty("platform", "TV");
             tvClient.addProperty("clientScreen", "WATCH");
+            // pg.jar buildPlayerBody TVHTML5: the rest of the Cobalt TV fingerprint — the player
+            // endpoint became unwilling to hand out formats to a TV client without it.
+            tvClient.addProperty("acceptLanguage", "en-US");
+            tvClient.addProperty("acceptRegion", "US");
+            tvClient.addProperty("utcOffsetMinutes", "0");
+            String[] browser = browserFromUserAgent(ua);
+            if (browser != null) {
+                tvClient.addProperty("browserName", browser[0]);
+                tvClient.addProperty("browserVersion", browser[1]);
+            }
+            JsonObject tvAppInfo = new JsonObject();
+            tvAppInfo.addProperty("appQuality", "TV_APP_QUALITY_FULL_ANIMATION");
+            tvAppInfo.addProperty("zylonLeftNav", 1);
+            tvClient.add("tvAppInfo", tvAppInfo);
         }
         tvClient.addProperty("userAgent", ua);
         tvClient.addProperty("hl", "en");
@@ -426,17 +463,36 @@ class YouTubeLite {
             if (client == null) continue;
             String clientName = optString(client, "clientName", null);
             try {
-                String url = "https://www.youtube.com/youtubei/v1/player?key=" + apiKey + "&prettyPrint=false";
+                // pg.jar's OAuth player URL carries no API key: the Bearer token is the
+                // credential and the key parameter is a web-client artifact.
+                String url = authenticated
+                        ? "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+                        : "https://www.youtube.com/youtubei/v1/player?key=" + apiKey + "&prettyPrint=false";
                 JsonObject playbackCtx = new JsonObject();
                 JsonObject contentCtx = new JsonObject();
                 contentCtx.addProperty("html5Preference", "HTML5_PREF_WANTS");
-                if (sts != null) contentCtx.addProperty("signatureTimestamp", sts);
+                if (sts != null) {
+                    // pg.jar rescales the web signature timestamp into the TV client's form.
+                    long tvSts = sts < 1000000 ? sts * 1000L + 1 : sts;
+                    contentCtx.addProperty("signatureTimestamp", authenticated ? tvSts : sts);
+                }
+                if (authenticated) {
+                    contentCtx.addProperty("lactMilliseconds", 60000);
+                    contentCtx.addProperty("isInlinePlaybackNoAd", 1);
+                }
                 playbackCtx.add("contentPlaybackContext", contentCtx);
+                if (authenticated) {
+                    JsonObject capabilities = new JsonObject();
+                    capabilities.addProperty("supportsVp9Encoding", 1);
+                    capabilities.addProperty("supportXhr", 0);
+                    playbackCtx.add("devicePlaybackCapabilities", capabilities);
+                }
 
                 if (visitorData != null) client.addProperty("visitorData", visitorData);
                 JsonObject payload = new JsonObject();
                 payload.add("context", ctx);
                 payload.addProperty("videoId", videoId);
+                if (authenticated) payload.addProperty("cpn", randomCpn());
                 payload.add("playbackContext", playbackCtx);
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
@@ -452,13 +508,15 @@ class YouTubeLite {
                 reqHeaders.put("Referer", referer);
                 reqHeaders.put("X-YouTube-Client-Name", String.valueOf(clientNameId(clientName)));
                 reqHeaders.put("X-YouTube-Client-Version", optString(client, "clientVersion", ""));
-                if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
+                // pg.jar's player request never carries a visitor id header on the OAuth line;
+                // the visitor binding lives in the body context, not the headers.
+                if (visitorData != null && !authenticated) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
                 String clientUa = optString(client, "userAgent", null);
                 if (clientUa != null) reqHeaders.put("User-Agent", clientUa);
                 // A refresh token only means that a login was stored. Treat this request as OAuth
                 // only if token() could actually supply the Bearer header; otherwise the old code
                 // sent a tokenless request while still suppressing BotGuard and called it OAuth.
-                if (authenticated && !YoutubeOAuth.apply(reqHeaders)) {
+                if (authenticated && !YoutubeOAuth.apply(reqHeaders, url)) {
                     SpiderDebug.log("YouTube OAuth player 未发送: access token 不可用, client=" + clientName);
                     continue;
                 }

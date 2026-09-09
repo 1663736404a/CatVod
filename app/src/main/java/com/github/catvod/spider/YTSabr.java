@@ -1,5 +1,7 @@
 package com.github.catvod.spider;
 
+import android.text.TextUtils;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -377,23 +379,41 @@ final class YTSabr {
         return p;
     }
 
+    /**
+     * pg.jar R.G.d keeps the TV client version current by scraping the /tv page (six hour cache,
+     * constant fallback), because a stale version is one of the signals the player endpoint
+     * started rejecting; the hardcoded value here is only the last resort.
+     */
     static String cobaltVersion() {
-        return "7.20260707.07.00";
+        return YoutubeOAuth.tvClientVersion();
     }
 
-    /** Cobalt/Starboard identity used by pg.jar's authenticated TV client. */
+    /** Cobalt/Starboard identity used by pg.jar's authenticated TV client (R.G.a). */
     static String cobaltUserAgent() {
         try {
-            return "Mozilla/5.0 (Linux arm64-v8a; Android " + android.os.Build.VERSION.SDK_INT
+            // pg.jar prefers the release string ("Android 11") over the sdk int.
+            String androidVersion = android.os.Build.VERSION.RELEASE;
+            if (TextUtils.isEmpty(androidVersion)) {
+                androidVersion = String.valueOf(android.os.Build.VERSION.SDK_INT);
+            }
+            String product = safeString(android.os.Build.PRODUCT, "Unknown_ATV");
+            String id = safeString(android.os.Build.ID, "Unknown");
+            String manufacturer = safeString(android.os.Build.MANUFACTURER, "Unknown");
+            String model = safeString(android.os.Build.MODEL, "Unknown");
+            return "Mozilla/5.0 (Linux arm64-v8a; Android " + androidVersion
                     + ") Cobalt/27.lts.1.1040559-gold (unlike Gecko) v8/13.8.258.31-jit gles Starboard/18, "
-                    + android.os.Build.PRODUCT + "/" + android.os.Build.ID
-                    + " (" + android.os.Build.MANUFACTURER + ", " + android.os.Build.MODEL
+                    + product + "/" + id
+                    + " (" + manufacturer + ", " + model
                     + ") com.google.android.youtube.tv/7.02.302";
         } catch (Throwable ignored) {
-            return "Mozilla/5.0 (Linux arm64-v8a; Android 34) Cobalt/27.lts.1.1040559-gold "
+            return "Mozilla/5.0 (Linux arm64-v8a; Android 14) Cobalt/27.lts.1.1040559-gold "
                     + "(unlike Gecko) v8/13.8.258.31-jit gles Starboard/18, generic/generic "
                     + "(Xiaomi, MI 6) com.google.android.youtube.tv/7.02.302";
         }
+    }
+
+    private static String safeString(String value, String fallback) {
+        return value == null || value.length() == 0 ? fallback : value;
     }
 
     /**
