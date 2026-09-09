@@ -1378,6 +1378,13 @@ class YTSabrSession {
 
         for (int redirectAttempt = 0; redirectAttempt < 4; redirectAttempt++) {
             long rn = requestCount + 1;
+            if (cfg.authenticated) {
+                // pg.jar re-runs R.s.b on every request, so redirect URLs get the session
+                // params re-appended too; this is what binds the SABR request to the player
+                // session — without cpn the endpoint answers a bare 403.
+                target = YTSabr.enhanceSabrUrl(target, cfg.cpn,
+                        cfg.clientInfo == null ? null : cfg.clientInfo.clientVersion);
+            }
             YTHttp.Result response = http.postSabr(target, payload, headers, rn);
             requestCount = rn;
             lastAbrAccessMs = System.currentTimeMillis();

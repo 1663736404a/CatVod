@@ -247,7 +247,12 @@ final class YTHttp {
      */
     Result postSabr(String url, byte[] payload, Map<String, String> headers, long rn) throws IOException {
         if (closed) throw new IOException("Canceled: YouTube spider destroyed");
-        String target = url + (url.contains("?") ? "&" : "?") + "rn=" + rn;
+        // pg.jar's updateQuery replaces an existing rn (redirect URLs can carry one) instead of
+        // appending a second copy.
+        String target = url;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("([?&])rn=[^&]*").matcher(url);
+        if (m.find()) target = m.replaceFirst(m.group(1) + "rn=" + rn);
+        else target = url + (url.contains("?") ? "&" : "?") + "rn=" + rn;
         Map<String, String> merged = new HashMap<>();
         merged.put("Content-Type", "application/x-protobuf");
         merged.put("Accept", "application/vnd.yt-ump");

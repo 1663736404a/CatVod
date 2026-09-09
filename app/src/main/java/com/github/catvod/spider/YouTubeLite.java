@@ -492,7 +492,10 @@ class YouTubeLite {
                 JsonObject payload = new JsonObject();
                 payload.add("context", ctx);
                 payload.addProperty("videoId", videoId);
-                if (authenticated) payload.addProperty("cpn", randomCpn());
+                // pg.jar generates one cpn per player request and later relays it onto every
+                // googlevideo URL (R.s.b), binding the SABR session to this request.
+                String cpn = authenticated ? randomCpn() : null;
+                if (cpn != null) payload.addProperty("cpn", cpn);
                 payload.add("playbackContext", playbackCtx);
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
@@ -552,6 +555,7 @@ class YouTubeLite {
 
                 data.addProperty("_client_name", clientName);
                 if (clientUa != null) data.addProperty("_client_ua", clientUa);
+                if (cpn != null) data.addProperty("_cpn", cpn);
                 JsonObject info = new JsonObject();
                 info.addProperty("clientNameId", clientNameId(clientName));
                 info.addProperty("clientName", clientName);
@@ -607,11 +611,17 @@ class YouTubeLite {
                 }
                 serverAbrUrl = YoutubeNsig.replace(serverAbrUrl, solvedN);
             }
-            String ustreamerConfig = traverseString(response, "playerConfig", "mediaCommonConfig",
-                    "mediaUstreamerRequestConfig", "videoPlaybackUstreamerConfig");
+            // pg.jar prefers the ustreamer config embedded in streamingData and falls back to the
+            // playerConfig copy; some responses only carry one of the two.
+            String ustreamerConfig = optString(sd, "videoPlaybackUstreamerConfig", null);
+            if (TextUtils.isEmpty(ustreamerConfig)) {
+                ustreamerConfig = traverseString(response, "playerConfig", "mediaCommonConfig",
+                        "mediaUstreamerRequestConfig", "videoPlaybackUstreamerConfig");
+            }
             // OAuth player responses carry a server-issued playbackCookie that authenticates the
             // SABR session without a poToken; anonymous ones omit it (synthesized later instead).
             byte[] playbackCookie = decodePlaybackCookie(optString(sd, "playbackCookie", null));
+            String cpn = optString(response, "_cpn", null);
 
             for (JsonObject raw : rawList) {
                 String cipher = optString(raw, "signatureCipher", optString(raw, "cipher", null));
@@ -631,6 +641,7 @@ class YouTubeLite {
                                 clientName, clientUa, clientInfo, authenticated);
                         if (sabrItem != null) {
                             sabrItem.sabrConfig.playbackCookie = playbackCookie;
+                            sabrItem.sabrConfig.cpn = cpn;
                             out.sabrFormats.add(sabrItem);
                         }
                     }

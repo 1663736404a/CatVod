@@ -64,6 +64,12 @@ final class YTSabr {
         boolean authenticated;
         /** Server-issued cookie from {@code streamingData.playbackCookie}, when present. */
         byte[] playbackCookie;
+        /**
+         * The content playback nonce sent with the player request. pg.jar R.s.b relays it as a
+         * {@code cpn} query parameter on every googlevideo URL: the server binds the SABR session
+         * to the player request through it, and a SABR request without it is rejected with 403.
+         */
+        String cpn;
         /** All SABR video formats of the player response; feeds the preferred-format lists. */
         List<YTFormat> videoPool;
         /** All SABR audio formats of the player response. */
@@ -414,6 +420,32 @@ final class YTSabr {
 
     private static String safeString(String value, String fallback) {
         return value == null || value.length() == 0 ? fallback : value;
+    }
+
+    /**
+     * pg.jar R.s.b appends the player request's cpn and client version to every googlevideo URL,
+     * and {@code alr/rqh/keepalive} to SABR ones, before each request (redirects included, since
+     * the redirect URL replaces the base and R.s.b runs again). The OAuth serverAbrStreamingUrl is
+     * bound to the player session through the cpn; without it the SABR endpoint answers 403.
+     */
+    static String enhanceSabrUrl(String url, String cpn, String clientVersion) {
+        if (url == null || url.isEmpty()) return url;
+        String out = url;
+        if (cpn != null && !cpn.isEmpty()) out = appendQuery(out, "cpn", cpn);
+        if (clientVersion != null && !clientVersion.isEmpty()) out = appendQuery(out, "cver", clientVersion);
+        boolean sabr = out.contains("sabr=1") || out.contains("sabr=true")
+                || out.contains("%2Csabr%2C") || out.contains(",sabr,");
+        if (sabr) {
+            out = appendQuery(out, "alr", "yes");
+            out = appendQuery(out, "rqh", "1");
+            out = appendQuery(out, "keepalive", "yes");
+        }
+        return out;
+    }
+
+    private static String appendQuery(String url, String key, String value) {
+        if (url.contains("?" + key + "=") || url.contains("&" + key + "=")) return url;
+        return url + (url.contains("?") ? "&" : "?") + key + "=" + value;
     }
 
     /**
