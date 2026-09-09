@@ -506,6 +506,9 @@ class YouTubeLite {
             }
             String ustreamerConfig = traverseString(response, "playerConfig", "mediaCommonConfig",
                     "mediaUstreamerRequestConfig", "videoPlaybackUstreamerConfig");
+            // OAuth player responses carry a server-issued playbackCookie that authenticates the
+            // SABR session without a poToken; anonymous ones omit it (synthesized later instead).
+            byte[] playbackCookie = decodePlaybackCookie(optString(sd, "playbackCookie", null));
 
             for (JsonObject raw : rawList) {
                 String cipher = optString(raw, "signatureCipher", optString(raw, "cipher", null));
@@ -523,7 +526,10 @@ class YouTubeLite {
                         seenSabr.add(sabrKey);
                         YTFormat sabrItem = normalizeSabrFormat(raw, serverAbrUrl, ustreamerConfig,
                                 clientName, clientUa, clientInfo, authenticated);
-                        if (sabrItem != null) out.sabrFormats.add(sabrItem);
+                        if (sabrItem != null) {
+                            sabrItem.sabrConfig.playbackCookie = playbackCookie;
+                            out.sabrFormats.add(sabrItem);
+                        }
                     }
                 }
             }
@@ -590,6 +596,21 @@ class YouTubeLite {
         item.acodec = hasAudio ? codecs : "none";
         if (clientUa != null) item.headers.put("User-Agent", clientUa);
         return item;
+    }
+
+    /** streamingData.playbackCookie is standard base64; some hosts emit the URL-safe alphabet. */
+    private static byte[] decodePlaybackCookie(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            return android.util.Base64.decode(value, android.util.Base64.DEFAULT);
+        } catch (Throwable ignored) {
+        }
+        try {
+            return android.util.Base64.decode(value.replace('-', '+').replace('_', '/'),
+                    android.util.Base64.DEFAULT);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private YTFormat normalizeSabrFormat(JsonObject fmt, String serverAbrUrl, String ustreamerConfig,

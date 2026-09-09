@@ -1,6 +1,7 @@
 package com.github.catvod.spider;
 
 import com.github.catvod.crawler.SpiderDebug;
+import com.google.gson.JsonObject;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -10,6 +11,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -122,6 +124,14 @@ class YTSabrSession {
     private Long lastRequestMs;
     private boolean stallRecovering;
     private String stallRecoverKey;
+    /** Wall clock of the last ABR request; feeds clientAbrState field 39 (time since access). */
+    private volatile long lastAbrAccessMs;
+    /** Wall clock of the last seek; feeds clientAbrState field 29 (seek age). */
+    private volatile long lastSeekWallMs;
+    /** Session uptime base; feeds clientAbrState field 36 (session elapsed). */
+    private final long createdRealtimeMs = android.os.SystemClock.elapsedRealtime();
+    /** Last decoded STREAM_PROTECTION_STATUS (UMP part 58); logged whenever it changes. */
+    private Integer lastProtectionStatus;
 
     private final Map<String, byte[]> initialized = new LinkedHashMap<>();
     private final Map<String, Buffered> buffered = new LinkedHashMap<>();
@@ -1249,9 +1259,60 @@ class YTSabrSession {
      */
     private void seek(long seekMs) {
         playerTimeMs = seekMs;
+        lastSeekWallMs = System.currentTimeMillis();
         buffered.clear();
         initialized.clear();
         partial.clear();
+    }
+
+    /** Fills the Cobalt behavior fingerprint every ClientAbrState reports to the server. */
+    private YTSabr.AbrEnv buildAbrEnv(YTFormat videoItem, YTFormat audioItem) {
+        YTSabr.AbrEnv env = new YTSabr.AbrEnv();
+        env.playerTimeMs = playerTimeMs;
+        env.hasVideo = videoItem != null && videoItem.itag != 0;
+        env.hasAudio = audioItem != null && audioItem.itag != 0;
+        env.hdrVideo = isHdrVideo(videoItem);
+        env.drcAudio = audioItem != null && audioItem.acodec != null
+                && audioItem.acodec.toLowerCase(Locale.US).contains("drc");
+        env.bandwidth = videoItem != null && videoItem.bitrate > 0 ? videoItem.bitrate
+                : audioItem != null ? audioItem.bitrate : 0;
+        long now = System.currentTimeMillis();
+        env.sinceAccessMs = lastAbrAccessMs > 0 ? Math.max(0, now - lastAbrAccessMs) : 0;
+        env.seekAgeMs = lastSeekWallMs > 0 ? Math.max(0, now - lastSeekWallMs) : 0;
+        env.sessionElapsedMs = Math.max(0, android.os.SystemClock.elapsedRealtime() - createdRealtimeMs);
+        return env;
+    }
+
+    /** pg.jar's isHdrVideo: HDR/PQ/HLG color markers or an HDR-capable VP9 profile. */
+    private static boolean isHdrVideo(YTFormat item) {
+        if (item == null) return false;
+        String codecs = item.codecs == null ? "" : item.codecs.toLowerCase(Locale.US);
+        if (codecs.startsWith("vp9.2") || codecs.startsWith("vp09.02") || codecs.startsWith("vp09.2")) {
+            return true;
+        }
+        JsonObject color = item.colorInfo;
+        if (color == null) return false;
+        String text = color.toString().toLowerCase(Locale.US);
+        return text.contains("hdr") || text.contains("smpte2084") || text.contains("arib-std-b67");
+    }
+
+    /**
+     * pg.jar's writeSynthPlaybackCookie: {video_format_id=7, audio_format_id=8}. Only used when
+     * neither the player response nor the server has issued a real cookie.
+     */
+    private static byte[] buildSynthPlaybackCookie(YTFormat videoItem, YTFormat audioItem) {
+        byte[] p = YTProto.EMPTY;
+        if (videoItem != null && videoItem.itag != 0) {
+            YTSabr.Config vc = videoItem.sabrConfig;
+            p = YTProto.concat(p, YTProto.pbBytes(7, YTSabr.buildFormatId(videoItem.itag,
+                    vc == null ? null : vc.lastModified, vc == null ? null : vc.xtags)));
+        }
+        if (audioItem != null && audioItem.itag != 0) {
+            YTSabr.Config ac = audioItem.sabrConfig;
+            p = YTProto.concat(p, YTProto.pbBytes(8, YTSabr.buildFormatId(audioItem.itag,
+                    ac == null ? null : ac.lastModified, ac == null ? null : ac.xtags)));
+        }
+        return p;
     }
 
     private List<byte[]> bufferedRanges() {
@@ -1275,7 +1336,18 @@ class YTSabrSession {
         List<byte[]> initializedIds = new ArrayList<>(initialized.values());
         List<byte[]> ranges = bufferedRanges();
         respectBackoff();
+        // OAuth line: replay pg.jar's Cobalt fingerprint. The opening request carries a Cobalt
+        // streamer id instead of credentials; every later one the playback cookie. Seed the server
+        // cookie from the player response first, synthesizing {videoId, audioId} only as fallback.
+        if (playbackCookie == null || playbackCookie.length == 0) {
+            if (cfg.playbackCookie != null && cfg.playbackCookie.length > 0) {
+                playbackCookie = cfg.playbackCookie;
+            } else if (requestCount > 0) {
+                playbackCookie = buildSynthPlaybackCookie(videoItem, audioItem);
+            }
+        }
         byte[] payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
+                buildAbrEnv(videoItem, audioItem), requestCount == 0,
                 playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
         String target = url != null ? url
                 : cfg.serverAbrStreamingUrl != null ? cfg.serverAbrStreamingUrl
@@ -1297,6 +1369,7 @@ class YTSabrSession {
             long rn = requestCount + 1;
             YTHttp.Result response = http.postSabr(target, payload, headers, rn);
             requestCount = rn;
+            lastAbrAccessMs = System.currentTimeMillis();
             lastStatus = response.code;
             SpiderDebug.log("YouTube SABR 响应: http=" + response.code + ", rn=" + rn);
             String redirectUrl = null;
@@ -1444,6 +1517,18 @@ class YTSabrSession {
                             activeContexts.remove(ctxType.intValue());
                             sabrContexts.remove(ctxType.intValue());
                         }
+                    } else if (part.id == YTSabr.STREAM_PROTECTION_STATUS) {
+                        // Field 1 varint: 2 = OK. A flip to another value means the server no
+                        // longer trusts this client: it keeps answering 200 but stops serving
+                        // media, which surfaces to the user as a ~60s cutoff once the buffer
+                        // drains. That is the signature the new clientAbrState exists to prevent.
+                        Long status = YTProto.getInt(part.data, 1);
+                        int value = status == null ? -1 : status.intValue();
+                        if (lastProtectionStatus == null || lastProtectionStatus != value) {
+                            SpiderDebug.log("YouTube SABR 流保护状态: " + value
+                                    + (value == 2 ? " (OK)" : " (非 OK, 服务端可能停止供流)"));
+                            lastProtectionStatus = value;
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -1497,6 +1582,7 @@ class YTSabrSession {
                 initializedIds = new ArrayList<>(initialized.values());
                 ranges = bufferedRanges();
                 payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
+                        buildAbrEnv(videoItem, audioItem), false,
                         playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
                 continue;
             }

@@ -55,6 +55,11 @@ final class YTProto {
         return concat(key(field, 0), varint(value));
     }
 
+    /** ProtoWire {@code varint()} semantics: zero and negative values are omitted entirely. */
+    static byte[] pbIntNZ(int field, long value) {
+        return value <= 0 ? EMPTY : concat(key(field, 0), varint(value));
+    }
+
     static byte[] pbBool(int field, boolean value) {
         return concat(key(field, 0), new byte[]{(byte) (value ? 1 : 0)});
     }
