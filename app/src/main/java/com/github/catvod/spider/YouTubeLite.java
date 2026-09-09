@@ -400,13 +400,24 @@ class YouTubeLite {
             // line; the SABR session is minted against this identity and the ABR requests must
             // present the same one, so the whole line stays Cobalt-coherent.
             ua = YTSabr.cobaltUserAgent();
-            tvClient.addProperty("platformName", "TV");
+            tvClient.addProperty("platform", "TV");
             tvClient.addProperty("clientScreen", "WATCH");
         }
         tvClient.addProperty("userAgent", ua);
         tvClient.addProperty("hl", "en");
         tvClient.addProperty("gl", "US");
         tv.add("client", tvClient);
+        if (authenticated) {
+            // pg.jar buildPlayerBody: the TVHTML5 context also carries request.useSsl
+            // and user.lockedSafetyMode alongside the Cobalt client identity.
+            JsonObject tvReq = new JsonObject();
+            tvReq.add("internalExperimentFlags", new JsonArray());
+            tvReq.addProperty("useSsl", 1);
+            tv.add("request", tvReq);
+            JsonObject tvUser = new JsonObject();
+            tvUser.addProperty("lockedSafetyMode", 0);
+            tv.add("user", tvUser);
+        }
         clients.add(tv);
 
         List<JsonObject> results = new ArrayList<>();
@@ -439,8 +450,7 @@ class YouTubeLite {
                 Map<String, String> reqHeaders = new HashMap<>();
                 reqHeaders.put("Origin", "https://www.youtube.com");
                 reqHeaders.put("Referer", referer);
-                reqHeaders.put("X-YouTube-Client-Name", authenticated ? "85"
-                        : String.valueOf(clientNameId(clientName)));
+                reqHeaders.put("X-YouTube-Client-Name", String.valueOf(clientNameId(clientName)));
                 reqHeaders.put("X-YouTube-Client-Version", optString(client, "clientVersion", ""));
                 if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
                 String clientUa = optString(client, "userAgent", null);
