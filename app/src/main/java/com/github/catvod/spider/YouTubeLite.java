@@ -443,13 +443,38 @@ class YouTubeLite {
                 if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
                 String clientUa = optString(client, "userAgent", null);
                 if (clientUa != null) reqHeaders.put("User-Agent", clientUa);
-                // Bearer + TV referer. This is what makes the response's playback cookie an
-                // authenticated credential, which is what lets SABR run without a poToken.
-                if (authenticated) YoutubeOAuth.apply(reqHeaders);
+                // A refresh token only means that a login was stored. Treat this request as OAuth
+                // only if token() could actually supply the Bearer header; otherwise the old code
+                // sent a tokenless request while still suppressing BotGuard and called it OAuth.
+                if (authenticated && !YoutubeOAuth.apply(reqHeaders)) {
+                    SpiderDebug.log("YouTube OAuth player 未发送: access token 不可用, client=" + clientName);
+                    continue;
+                }
 
-                String body = http.postJson(url, payload.toString(), reqHeaders);
-                JsonObject data = Json.safeObject(body);
+                YTHttp.Text response = http.postJsonText(url, payload.toString(), reqHeaders);
+                if (response == null) {
+                    SpiderDebug.log("YouTube " + (authenticated ? "OAuth" : "匿名")
+                            + " player 请求失败: 无 HTTP 响应, client=" + clientName);
+                    continue;
+                }
+                JsonObject data = Json.safeObject(response.body);
                 JsonObject sd = traverseObject(data, "streamingData");
+                String playStatus = traverseString(data, "playabilityStatus", "status");
+                String playReason = traverseString(data, "playabilityStatus", "reason");
+                int directCount = sd == null ? 0
+                        : arrayObjects(sd, "formats").size() + arrayObjects(sd, "adaptiveFormats").size();
+                boolean hasAbr = sd != null && !TextUtils.isEmpty(optString(sd, "serverAbrStreamingUrl", null));
+                boolean hasCookie = sd != null && !TextUtils.isEmpty(optString(sd, "playbackCookie", null));
+                SpiderDebug.log("YouTube " + (authenticated ? "OAuth" : "匿名")
+                        + " player 响应: http=" + response.code
+                        + ", client=" + clientName
+                        + ", status=" + (playStatus == null ? "-" : playStatus)
+                        + ", reason=" + compactLog(playReason)
+                        + ", formats=" + directCount
+                        + ", serverAbr=" + hasAbr
+                        + ", playbackCookie=" + hasCookie);
+                // Keep an error response long enough for the caller to report its playability
+                // status. Previously it vanished here and the only visible symptom was formats=0.
                 if (sd == null || sd.size() == 0) continue;
                 if (authenticated) {
                     YoutubeOAuth.rememberVisitor(traverseString(data, "responseContext", "visitorData"));
@@ -1176,6 +1201,12 @@ class YouTubeLite {
         }
         return cur != null && cur.isJsonObject() ? cur.getAsJsonObject() : null;
     }
+
+    static String compactLog(String value) {
+        if (value == null || value.isEmpty()) return "-";
+        return value.replace('\\n', ' ').replace('\\r', ' ').replace(',', ';');
+    }
+
 
     static String traverseString(JsonObject root, String... path) {
         JsonElement cur = root;

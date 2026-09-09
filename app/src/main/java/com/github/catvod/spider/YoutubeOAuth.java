@@ -171,15 +171,21 @@ final class YoutubeOAuth {
         }
     }
 
-    /** Adds the authenticated TV identity to one InnerTube request. */
-    static void apply(Map<String, String> headers) {
-        if (headers == null) return;
+    /**
+     * Adds the authenticated TV identity to one InnerTube request.
+     *
+     * @return {@code true} only when this request actually received a valid Bearer credential.
+     *         A stored refresh token alone is not proof that the current request is authenticated.
+     */
+    static boolean apply(Map<String, String> headers) {
+        if (headers == null) return false;
         String access = token();
-        if (TextUtils.isEmpty(access)) return;
+        if (TextUtils.isEmpty(access)) return false;
         headers.put("Authorization", "Bearer " + access);
         headers.put("X-Goog-AuthUser", "0");
         headers.put("Referer", TV_PAGE);
         headers.put("Origin", "https://www.youtube.com");
+        return true;
     }
 
     /**
