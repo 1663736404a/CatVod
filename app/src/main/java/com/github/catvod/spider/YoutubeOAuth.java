@@ -409,7 +409,9 @@ final class YoutubeOAuth {
         JsonObject payload = new JsonObject();
         payload.add("context", context);
         Map<String, String> headers = tvHeaders();
-        headers.put("X-YouTube-Client-Name", "7");
+        // 7 is the Cobalt streamer id used inside SABR protobufs; the InnerTube
+        // TVHTML5 HTTP header is client id 85.
+        headers.put("X-YouTube-Client-Name", "85");
         headers.put("X-YouTube-Client-Version", YoutubePlayer.DEFAULT_VERSION);
         headers.put("User-Agent", YTSabr.cobaltUserAgent());
         apply(headers);
@@ -449,7 +451,8 @@ final class YoutubeOAuth {
             client.addProperty("clientVersion", YoutubePlayer.DEFAULT_VERSION);
             context.add("client", client);
             Map<String, String> headers = tvHeaders();
-            headers.put("X-YouTube-Client-Name", "7");
+            // 7 belongs to the Cobalt SABR streamer context, not this HTTP request.
+            headers.put("X-YouTube-Client-Name", "85");
             headers.put("X-YouTube-Client-Version", YTSabr.cobaltVersion());
             headers.put("User-Agent", "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version");
             if (!apply(headers)) return;

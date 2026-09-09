@@ -439,7 +439,8 @@ class YouTubeLite {
                 Map<String, String> reqHeaders = new HashMap<>();
                 reqHeaders.put("Origin", "https://www.youtube.com");
                 reqHeaders.put("Referer", referer);
-                reqHeaders.put("X-YouTube-Client-Name", String.valueOf(clientNameId(clientName)));
+                reqHeaders.put("X-YouTube-Client-Name", authenticated ? "85"
+                        : String.valueOf(clientNameId(clientName)));
                 reqHeaders.put("X-YouTube-Client-Version", optString(client, "clientVersion", ""));
                 if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
                 String clientUa = optString(client, "userAgent", null);
