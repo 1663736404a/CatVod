@@ -387,7 +387,8 @@ class YouTubeLite {
                                            String referer, String visitorData, Integer sts,
                                            boolean authenticated) {
         List<JsonObject> clients = new ArrayList<>();
-        String version = optString(config, "tvhtml5_client_version", "7.20250312.16.00");
+        String version = authenticated ? YTSabr.cobaltVersion()
+                : optString(config, "tvhtml5_client_version", "7.20250312.16.00");
         String ua = optString(config, "tvhtml5_user_agent", "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
                 + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15");
         JsonObject tv = new JsonObject();

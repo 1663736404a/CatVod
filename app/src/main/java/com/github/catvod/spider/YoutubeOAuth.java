@@ -38,7 +38,10 @@ final class YoutubeOAuth {
     private static final String TV_PAGE = "https://www.youtube.com/tv";
     private static final String DEVICE_URL = "https://www.youtube.com/o/oauth2/device/code";
     private static final String TOKEN_URL = "https://www.youtube.com/o/oauth2/token";
-    private static final String TV_BOOTSTRAP = "https://www.youtube.com/youtubei/v1/tv?prettyPrint=false";
+    private static final String TV_BOOTSTRAP =
+            "https://www.youtube.com/youtubei/v1/tv?prettyPrint=false";
+    private static final String ACCOUNT_LIST =
+            "https://www.youtube.com/youtubei/v1/account/accounts_list?prettyPrint=false";
     private static final String SCOPE = "https://www.googleapis.com/auth/youtube";
     /** The device flow uses this URL-shaped grant type rather than the usual {@code urn:} form. */
     private static final String GRANT_DEVICE = "http://oauth.net/grant_type/device/1.0";
@@ -57,6 +60,10 @@ final class YoutubeOAuth {
     private static final String KEY_EXPIRES = "yt_oauth_expires_at";
     private static final String KEY_VISITOR = "yt_oauth_visitor_data";
     private static final String KEY_VISITOR_AT = "yt_oauth_visitor_at";
+    /** pg.jar persists the TV account page id and sends it as X-Goog-Pageid. */
+    private static final String KEY_PAGE_ID = "yt_oauth_page_id";
+    /** Cookies from the authenticated TV session must follow subsequent player calls. */
+    private static final String KEY_COOKIES = "yt_oauth_cookies";
 
     /** Refresh this far before the server-declared expiry so no request races the boundary. */
     private static final long REFRESH_MARGIN_MS = 300000L;
@@ -149,6 +156,8 @@ final class YoutubeOAuth {
             write(KEY_EXPIRES, "");
             write(KEY_VISITOR, "");
             write(KEY_VISITOR_AT, "");
+            write(KEY_PAGE_ID, "");
+            write(KEY_COOKIES, "");
         }
         pending = null;
         SpiderDebug.log("YouTube OAuth 已退出登录");
@@ -183,6 +192,10 @@ final class YoutubeOAuth {
         if (TextUtils.isEmpty(access)) return false;
         headers.put("Authorization", "Bearer " + access);
         headers.put("X-Goog-AuthUser", "0");
+        String pageId = read(KEY_PAGE_ID);
+        if (!TextUtils.isEmpty(pageId)) headers.put("X-Goog-Pageid", pageId);
+        String cookies = read(KEY_COOKIES);
+        if (!TextUtils.isEmpty(cookies)) headers.put("Cookie", cookies);
         headers.put("Referer", TV_PAGE);
         headers.put("Origin", "https://www.youtube.com");
         return true;
@@ -198,7 +211,8 @@ final class YoutubeOAuth {
         if (!loggedIn()) return null;
         String cached = read(KEY_VISITOR);
         long fetchedAt = readLong(KEY_VISITOR_AT);
-        if (YoutubeVisitor.usable(cached) && System.currentTimeMillis() - fetchedAt < VISITOR_TTL_MS) {
+        if (YoutubeVisitor.usable(cached) && !TextUtils.isEmpty(read(KEY_PAGE_ID))
+                && System.currentTimeMillis() - fetchedAt < VISITOR_TTL_MS) {
             return cached;
         }
         String fresh = bootstrap();
@@ -397,11 +411,25 @@ final class YoutubeOAuth {
         Map<String, String> headers = tvHeaders();
         headers.put("X-YouTube-Client-Name", "7");
         headers.put("X-YouTube-Client-Version", YoutubePlayer.DEFAULT_VERSION);
+        headers.put("User-Agent", YTSabr.cobaltUserAgent());
         apply(headers);
         YTHttp.Text response = http().postJsonText(TV_BOOTSTRAP, payload.toString(), headers);
         if (response == null) return null;
-        String fromJson = YouTubeLite.traverseString(Json.safeObject(response.body),
-                "responseContext", "visitorData");
+        JsonObject body = Json.safeObject(response.body);
+        String fromJson = YouTubeLite.traverseString(body, "responseContext", "visitorData");
+        // pg.jar extracts pageId/account metadata from accounts_list and persists it for
+        // X-Goog-Pageid on every authenticated player request.
+        String pageId = YouTubeLite.traverseString(body, "pageId");
+        if (TextUtils.isEmpty(pageId)) pageId = findJsonString(response.body, "pageId");
+        if (!TextUtils.isEmpty(pageId)) write(KEY_PAGE_ID, pageId);
+        if (!response.cookies.isEmpty()) {
+            String joined = joinCookies(response.cookies);
+            if (!TextUtils.isEmpty(joined)) write(KEY_COOKIES, joined);
+        }
+        // pg.jar performs an accounts_list probe as part of the OAuth TV session health check.
+        // Its response is where pageId is normally returned; do this even when /tv already gave
+        // visitorData so the subsequent player request has the complete authentication context.
+        fetchAccountMeta();
         if (YoutubeVisitor.usable(fromJson)) return fromJson;
         for (String cookie : response.cookies) {
             Matcher matcher = RE_VISITOR_COOKIE.matcher(cookie == null ? "" : cookie);
@@ -410,6 +438,68 @@ final class YoutubeOAuth {
             if (YoutubeVisitor.usable(value)) return value;
         }
         return null;
+    }
+
+    private static void fetchAccountMeta() {
+        try {
+            JsonObject payload = new JsonObject();
+            JsonObject context = new JsonObject();
+            JsonObject client = new JsonObject();
+            client.addProperty("clientName", "WEB");
+            client.addProperty("clientVersion", YoutubePlayer.DEFAULT_VERSION);
+            context.add("client", client);
+            Map<String, String> headers = tvHeaders();
+            headers.put("X-YouTube-Client-Name", "7");
+            headers.put("X-YouTube-Client-Version", YTSabr.cobaltVersion());
+            headers.put("User-Agent", "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version");
+            if (!apply(headers)) return;
+            YTHttp.Text result = http().postJsonText(ACCOUNT_LIST, payload.toString(), headers);
+            if (result == null || result.code < 200 || result.code >= 300) return;
+            if (!result.cookies.isEmpty()) {
+                String joined = joinCookies(result.cookies);
+                if (!TextUtils.isEmpty(joined)) write(KEY_COOKIES, joined);
+            }
+            String pageId = findJsonString(result.body, "pageId");
+            if (!TextUtils.isEmpty(pageId)) write(KEY_PAGE_ID, pageId);
+            String visitor = YouTubeLite.traverseString(Json.safeObject(result.body),
+                    "responseContext", "visitorData");
+            if (YoutubeVisitor.usable(visitor)) {
+                write(KEY_VISITOR, visitor);
+                write(KEY_VISITOR_AT, String.valueOf(System.currentTimeMillis()));
+            }
+            SpiderDebug.log("YouTube OAuth TV accounts_list 会话探测成功: pageId="
+                    + (!TextUtils.isEmpty(pageId)) + ", visitor=" + (YoutubeVisitor.usable(visitor)));
+        } catch (Throwable e) {
+            SpiderDebug.log("YouTube OAuth TV accounts_list 探测失败: " + e.getClass().getSimpleName());
+        }
+    }
+
+    private static String joinCookies(List<String> cookies) {
+        StringBuilder out = new StringBuilder();
+        for (String raw : cookies) {
+            if (TextUtils.isEmpty(raw)) continue;
+            String first = raw;
+            int semi = first.indexOf(';');
+            if (semi >= 0) first = first.substring(0, semi);
+            if (out.length() > 0) out.append("; ");
+            out.append(first);
+        }
+        return out.toString();
+    }
+
+    private static String findJsonString(String body, String key) {
+        if (TextUtils.isEmpty(body)) return "";
+        try {
+            String needle = "\"" + key + "\"";
+            int at = body.indexOf(needle);
+            if (at < 0) return "";
+            int colon = body.indexOf(':', at + needle.length());
+            int q1 = body.indexOf('\"', colon + 1);
+            int q2 = body.indexOf('\"', q1 + 1);
+            return q1 >= 0 && q2 > q1 ? body.substring(q1 + 1, q2) : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     private static String decode(String value) {

@@ -377,10 +377,11 @@ final class YTSabr {
         return p;
     }
 
-    /**
-     * The Cobalt/Starboard user agent pg.jar uses for every TVHTML5 request on the OAuth line
-     * (player request clientContext, player HTTP header, and SABR ABR requests).
-     */
+    static String cobaltVersion() {
+        return "7.20260707.07.00";
+    }
+
+    /** Cobalt/Starboard identity used by pg.jar's authenticated TV client. */
     static String cobaltUserAgent() {
         try {
             return "Mozilla/5.0 (Linux arm64-v8a; Android " + android.os.Build.VERSION.SDK_INT
