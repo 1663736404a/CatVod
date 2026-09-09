@@ -394,6 +394,14 @@ class YouTubeLite {
         JsonObject tvClient = new JsonObject();
         tvClient.addProperty("clientName", "TVHTML5");
         tvClient.addProperty("clientVersion", version);
+        if (authenticated) {
+            // pg.jar declares the Cobalt user agent in the TVHTML5 clientContext for the OAuth
+            // line; the SABR session is minted against this identity and the ABR requests must
+            // present the same one, so the whole line stays Cobalt-coherent.
+            ua = YTSabr.cobaltUserAgent();
+            tvClient.addProperty("platformName", "TV");
+            tvClient.addProperty("clientScreen", "WATCH");
+        }
         tvClient.addProperty("userAgent", ua);
         tvClient.addProperty("hl", "en");
         tvClient.addProperty("gl", "US");
@@ -531,6 +539,22 @@ class YouTubeLite {
                             out.sabrFormats.add(sabrItem);
                         }
                     }
+                }
+            }
+        }
+        // Back-fill the format pools the Cobalt ABR line needs for its preferred-format lists
+        // (request fields 16/17): every SABR video format and every audio format of this response.
+        if (!out.sabrFormats.isEmpty()) {
+            List<YTFormat> videoPool = new ArrayList<>();
+            List<YTFormat> audioPool = new ArrayList<>();
+            for (YTFormat item : out.sabrFormats) {
+                if (item.hasVideo()) videoPool.add(item);
+                else audioPool.add(item);
+            }
+            for (YTFormat item : out.sabrFormats) {
+                if (item.sabrConfig != null) {
+                    item.sabrConfig.videoPool = videoPool;
+                    item.sabrConfig.audioPool = audioPool;
                 }
             }
         }

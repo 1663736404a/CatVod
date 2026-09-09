@@ -1266,8 +1266,9 @@ class YTSabrSession {
     }
 
     /** Fills the Cobalt behavior fingerprint every ClientAbrState reports to the server. */
-    private YTSabr.AbrEnv buildAbrEnv(YTFormat videoItem, YTFormat audioItem) {
+    private YTSabr.AbrEnv buildAbrEnv(YTFormat videoItem, YTFormat audioItem, boolean init) {
         YTSabr.AbrEnv env = new YTSabr.AbrEnv();
+        env.init = init;
         env.playerTimeMs = playerTimeMs;
         env.hasVideo = videoItem != null && videoItem.itag != 0;
         env.hasAudio = audioItem != null && audioItem.itag != 0;
@@ -1331,23 +1332,24 @@ class YTSabrSession {
     /** Issues one SABR request and commits every segment it completes. */
     private void pumpOnce(YTSabr.Config cfg, YTFormat videoItem, YTFormat audioItem) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
-        Integer videoItag = videoItem == null || videoItem.itag == 0 ? null : videoItem.itag;
-        Integer audioItag = audioItem == null || audioItem.itag == 0 ? null : audioItem.itag;
         List<byte[]> initializedIds = new ArrayList<>(initialized.values());
         List<byte[]> ranges = bufferedRanges();
         respectBackoff();
+        boolean cobalt = cfg.poToken == null || cfg.poToken.isEmpty();
         // OAuth line: replay pg.jar's Cobalt fingerprint. The opening request carries a Cobalt
         // streamer id instead of credentials; every later one the playback cookie. Seed the server
         // cookie from the player response first, synthesizing {videoId, audioId} only as fallback.
         if (playbackCookie == null || playbackCookie.length == 0) {
             if (cfg.playbackCookie != null && cfg.playbackCookie.length > 0) {
                 playbackCookie = cfg.playbackCookie;
+                SpiderDebug.log("YouTube SABR 种入服务端 playbackCookie: " + playbackCookie.length + " 字节");
             } else if (requestCount > 0) {
                 playbackCookie = buildSynthPlaybackCookie(videoItem, audioItem);
+                SpiderDebug.log("YouTube SABR player 响应无 playbackCookie, 使用合成 cookie");
             }
         }
-        byte[] payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
-                buildAbrEnv(videoItem, audioItem), requestCount == 0,
+        byte[] payload = YTSabr.buildVpabrRequest(cfg, videoItem, audioItem, playerTimeMs,
+                buildAbrEnv(videoItem, audioItem, requestCount == 0), requestCount == 0,
                 playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
         String target = url != null ? url
                 : cfg.serverAbrStreamingUrl != null ? cfg.serverAbrStreamingUrl
@@ -1355,11 +1357,20 @@ class YTSabrSession {
         if (target == null || target.indexOf("n=") < 0) {
             throw new Exception("SABR missing solved server URL");
         }
+        Integer videoItag = videoItem == null || videoItem.itag == 0 ? null : videoItem.itag;
+        Integer audioItag = audioItem == null || audioItem.itag == 0 ? null : audioItem.itag;
         SpiderDebug.log("YouTube SABR 请求准备: client=" + cfg.clientName + ", videoItag="
                 + videoItag + ", audioItag=" + audioItag + ", rn=" + (requestCount + 1));
-        Map<String, String> headers = new HashMap<>();
-        if (videoItem != null && !videoItem.headers.isEmpty()) headers.putAll(videoItem.headers);
-        else if (audioItem != null) headers.putAll(audioItem.headers);
+        Map<String, String> headers;
+        if (cobalt) {
+            // pg.jar posts SABR with R.G.b's Cobalt/Starboard browser headers and no Authorization.
+            String ua = cfg.clientInfo == null ? null : cfg.clientInfo.userAgent;
+            headers = YTSabr.buildCobaltHeaders(ua);
+        } else {
+            headers = new HashMap<>();
+            if (videoItem != null && !videoItem.headers.isEmpty()) headers.putAll(videoItem.headers);
+            else if (audioItem != null) headers.putAll(audioItem.headers);
+        }
 
         Set<Integer> targetItags = new HashSet<>();
         if (videoItag != null) targetItags.add(videoItag);
@@ -1525,8 +1536,11 @@ class YTSabrSession {
                         Long status = YTProto.getInt(part.data, 1);
                         int value = status == null ? -1 : status.intValue();
                         if (lastProtectionStatus == null || lastProtectionStatus != value) {
+                            StringBuilder hex = new StringBuilder();
+                            for (byte b : part.data) hex.append(String.format("%02x", b));
                             SpiderDebug.log("YouTube SABR 流保护状态: " + value
-                                    + (value == 2 ? " (OK)" : " (非 OK, 服务端可能停止供流)"));
+                                    + (value == 2 ? " (OK)" : " (非 OK, 服务端可能停止供流)")
+                                    + ", data=" + hex);
                             lastProtectionStatus = value;
                         }
                     }
@@ -1581,8 +1595,9 @@ class YTSabrSession {
                 // state instead of resending a stale payload to the new CDN.
                 initializedIds = new ArrayList<>(initialized.values());
                 ranges = bufferedRanges();
-                payload = YTSabr.buildVpabrRequest(cfg, videoItag, audioItag, playerTimeMs,
-                        buildAbrEnv(videoItem, audioItem), false,
+                boolean retryInit = requestCount == 0;
+                payload = YTSabr.buildVpabrRequest(cfg, videoItem, audioItem, playerTimeMs,
+                        buildAbrEnv(videoItem, audioItem, retryInit), retryInit,
                         playbackCookie, initializedIds, ranges, activeContexts(), unsentContexts());
                 continue;
             }

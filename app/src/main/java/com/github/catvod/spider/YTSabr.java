@@ -1,7 +1,9 @@
 package com.github.catvod.spider;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -60,6 +62,10 @@ final class YTSabr {
         boolean authenticated;
         /** Server-issued cookie from {@code streamingData.playbackCookie}, when present. */
         byte[] playbackCookie;
+        /** All SABR video formats of the player response; feeds the preferred-format lists. */
+        List<YTFormat> videoPool;
+        /** All SABR audio formats of the player response. */
+        List<YTFormat> audioPool;
         int itag;
         String xtags;
         String lastModified;
@@ -83,6 +89,8 @@ final class YTSabr {
         long sinceAccessMs;
         long seekAgeMs;
         boolean live;
+        /** True for the session-opening request; suppresses clientAbrState field 29. */
+        boolean init;
     }
 
     /** A single {@code SabrContextUpdate} the server asked us to replay. */
@@ -158,7 +166,7 @@ final class YTSabr {
         p = YTProto.concat(p, YTProto.pbInt(21, 0));
         p = YTProto.concat(p, YTProto.pbIntNZ(23, env.bandwidth));
         p = YTProto.concat(p, YTProto.pbInt(28, Math.max(0, env.playerTimeMs)));
-        p = YTProto.concat(p, YTProto.pbIntNZ(29, env.live ? 0 : env.seekAgeMs));
+        p = YTProto.concat(p, YTProto.pbIntNZ(29, env.init ? 0 : env.seekAgeMs));
         p = YTProto.concat(p, YTProto.pbInt(34, 5));
         p = YTProto.concat(p, YTProto.pbIntNZ(36, env.sessionElapsedMs));
         p = YTProto.concat(p, YTProto.pbIntNZ(39, env.sinceAccessMs));
@@ -370,16 +378,105 @@ final class YTSabr {
     }
 
     /**
+     * The Cobalt/Starboard user agent pg.jar uses for every TVHTML5 request on the OAuth line
+     * (player request clientContext, player HTTP header, and SABR ABR requests).
+     */
+    static String cobaltUserAgent() {
+        try {
+            return "Mozilla/5.0 (Linux arm64-v8a; Android " + android.os.Build.VERSION.SDK_INT
+                    + ") Cobalt/27.lts.1.1040559-gold (unlike Gecko) v8/13.8.258.31-jit gles Starboard/18, "
+                    + android.os.Build.PRODUCT + "/" + android.os.Build.ID
+                    + " (" + android.os.Build.MANUFACTURER + ", " + android.os.Build.MODEL
+                    + ") com.google.android.youtube.tv/7.02.302";
+        } catch (Throwable ignored) {
+            return "Mozilla/5.0 (Linux arm64-v8a; Android 34) Cobalt/27.lts.1.1040559-gold "
+                    + "(unlike Gecko) v8/13.8.258.31-jit gles Starboard/18, generic/generic "
+                    + "(Xiaomi, MI 6) com.google.android.youtube.tv/7.02.302";
+        }
+    }
+
+    /**
+     * pg.jar's R.G.b header set for SABR ABR posts — the Cobalt/Starboard browser fingerprint.
+     * No Authorization header; identity comes from the playback cookie in the body.
+     */
+    static Map<String, String> buildCobaltHeaders(String userAgent) {
+        String ua = userAgent == null || userAgent.isEmpty() ? cobaltUserAgent() : userAgent;
+        String make;
+        String fingerprint;
+        try {
+            make = android.os.Build.MANUFACTURER;
+            fingerprint = android.os.Build.FINGERPRINT;
+        } catch (Throwable ignored) {
+            make = "Xiaomi";
+            fingerprint = "Xiaomi/generic/generic:15/AP3A.240905.015/eng.build.20250101:user/release-keys";
+        }
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("sec-ch-ua-platform", "\"Starboard\"");
+        headers.put("User-Agent", ua);
+        headers.put("sec-ch-ua", "\"" + make + "\";v=\"27\"");
+        headers.put("sec-ch-ua-mobile", "?0");
+        headers.put("Accept", "*/*");
+        headers.put("Origin", "https://www.youtube.com");
+        headers.put("sec-fetch-site", "cross-site");
+        headers.put("sec-fetch-mode", "cors");
+        headers.put("sec-fetch-dest", "empty");
+        headers.put("sec-fetch-storage-access", "none");
+        headers.put("Referer", "https://www.youtube.com/");
+        headers.put("Accept-Encoding", "gzip, deflate, br");
+        headers.put("Accept-Language", "en-US");
+        headers.put("sec-ch-ua-co-android-build-fingerprint", fingerprint);
+        headers.put("sec-ch-ua-co-android-os-experience", "Watson");
+        headers.put("sec-ch-ua-co-android-play-services-version", "250832035");
+        headers.put("sec-ch-ua-co-youtube-certification-scope", "");
+        headers.put("priority", "u=1, i");
+        return headers;
+    }
+
+    /**
      * VideoPlaybackAbrRequest: client_abr_state=1, initialized_format_ids=2, buffered_ranges=3,
      * player_time_ms=4, video_playback_ustreamer_config=5, preferred_audio_format_ids=16,
      * preferred_video_format_ids=17, streamer_context=19.
      */
-    static byte[] buildVpabrRequest(Config cfg, Integer videoItag, Integer audioItag, long startTimeMs,
+        /**
+     * VPAbrRequest top-level fields. Two shapes:
+     *
+     * <p><b>Cobalt (OAuth, no poToken)</b> — exactly pg.jar's {@code buildAbrRequest}: 1 abrState,
+     * 2 selected formatId (omitted on init), 3 one synthetic full buffered range (omitted on init),
+     * 5 ustreamer config, 16 preferred audio format ids, 17 preferred video format ids, 19
+     * streamerContext. No field 4. The server gates media on this fingerprint, so byte parity with
+     * the reference client matters here.
+     *
+     * <p><b>Legacy (poToken line)</b> — the shape this app has always sent and that plays full
+     * length with a BotGuard token: 1 abrState, 2 every initialized formatId, 3 real buffered
+     * ranges, 4 player time, 5 ustreamer, 16/17 selected ids, 19 streamerContext.
+     */
+    static byte[] buildVpabrRequest(Config cfg, YTFormat videoItem, YTFormat audioItem, long startTimeMs,
                                     AbrEnv env, boolean init, byte[] playbackCookie,
                                     List<byte[]> initializedFormatIds,
                                     List<byte[]> bufferedRanges, Map<Integer, SabrContext> sabrContexts,
                                     Set<Integer> unsentContexts) {
+        ClientInfo clientInfo = cfg.clientInfo == null ? new ClientInfo() : cfg.clientInfo;
+        boolean cobalt = cfg.poToken == null || cfg.poToken.isEmpty();
+        YTFormat primary = videoItem != null && videoItem.itag != 0 ? videoItem : audioItem;
         byte[] p = YTProto.pbMsg(1, buildClientAbrState(env));
+        byte[] ustreamer = YTProto.b64urlDecode(cfg.videoPlaybackUstreamerConfig);
+        if (cobalt) {
+            if (!init && primary != null && primary.itag != 0) {
+                byte[] fid = buildFormatId(primary, isVideoFormat(primary));
+                p = YTProto.concat(p, YTProto.pbBytes(2, fid));
+                p = YTProto.concat(p, YTProto.pbBytes(3, buildFullBufferedRange(fid)));
+            }
+            if (ustreamer != null && ustreamer.length > 0) p = YTProto.concat(p, YTProto.pbBytes(5, ustreamer));
+            for (byte[] id : buildPreferredAudioFormatIds(cfg, audioItem)) {
+                p = YTProto.concat(p, YTProto.pbBytes(16, id));
+            }
+            for (byte[] id : buildPreferredVideoFormatIds(cfg, primary)) {
+                p = YTProto.concat(p, YTProto.pbBytes(17, id));
+            }
+            p = YTProto.concat(p, YTProto.pbMsg(19,
+                    buildStreamerContext(clientInfo, cfg.poToken, playbackCookie, sabrContexts, unsentContexts, init)));
+            return p;
+        }
         if (initializedFormatIds != null) {
             for (byte[] id : initializedFormatIds) {
                 if (id != null && id.length > 0) p = YTProto.concat(p, YTProto.pbMsg(2, id));
@@ -391,18 +488,116 @@ final class YTSabr {
             }
         }
         p = YTProto.concat(p, YTProto.pbInt(4, Math.max(0, startTimeMs)));
-        byte[] ustreamer = YTProto.b64urlDecode(cfg.videoPlaybackUstreamerConfig);
         if (ustreamer != null && ustreamer.length > 0) p = YTProto.concat(p, YTProto.pbBytes(5, ustreamer));
-        if (audioItag != null && audioItag != 0) {
-            p = YTProto.concat(p, YTProto.pbMsg(16, buildFormatId(audioItag)));
+        if (audioItem != null && audioItem.itag != 0) {
+            p = YTProto.concat(p, YTProto.pbMsg(16, buildFormatId(audioItem.itag)));
         }
-        if (videoItag != null && videoItag != 0) {
-            p = YTProto.concat(p, YTProto.pbMsg(17, buildFormatId(videoItag, cfg.lastModified, cfg.xtags)));
+        if (videoItem != null && videoItem.itag != 0) {
+            p = YTProto.concat(p, YTProto.pbMsg(17, buildFormatId(videoItem.itag, cfg.lastModified, cfg.xtags)));
         }
-        ClientInfo clientInfo = cfg.clientInfo == null ? new ClientInfo() : cfg.clientInfo;
         p = YTProto.concat(p, YTProto.pbMsg(19,
                 buildStreamerContext(clientInfo, cfg.poToken, playbackCookie, sabrContexts, unsentContexts, init)));
         return p;
+    }
+
+    private static boolean isVideoFormat(YTFormat fmt) {
+        return fmt.vcodec != null && !fmt.vcodec.isEmpty() && !"none".equals(fmt.vcodec);
+    }
+
+    /** pg.jar's encodeFormatId: {1 itag, 2 lastModified, 3 xtags (always for video, even empty)}. */
+    static byte[] buildFormatId(YTFormat fmt, boolean video) {
+        YTSabr.Config c = fmt.sabrConfig;
+        byte[] p = YTProto.pbInt(1, fmt.itag);
+        if (c != null && c.lastModified != null && !c.lastModified.isEmpty()) {
+            byte[] lm = YTProto.b64urlDecode(c.lastModified);
+            if (lm != null && lm.length > 0) p = YTProto.concat(p, YTProto.pbBytes(2, lm));
+        }
+        String xtags = c == null ? null : c.xtags;
+        byte[] xb = xtags == null || xtags.isEmpty() ? YTProto.EMPTY : xtags.getBytes();
+        if (video || xb.length > 0) p = YTProto.concat(p, YTProto.pbBytes(3, xb));
+        return p;
+    }
+
+    /**
+     * pg.jar's encodeFullBufferedRange: a fixed synthetic "everything buffered" range,
+     * {formatId=1, 3=INT_MAX, 4=INT_MAX, 5=INT_MAX, 6={2=INT_MAX, 3=1000}}. The Cobalt line sends
+     * this constant instead of the real buffered ranges.
+     */
+    static byte[] buildFullBufferedRange(byte[] formatId) {
+        byte[] p = YTProto.pbBytes(1, formatId);
+        p = YTProto.concat(p, YTProto.pbInt(3, Integer.MAX_VALUE));
+        p = YTProto.concat(p, YTProto.pbInt(4, Integer.MAX_VALUE));
+        p = YTProto.concat(p, YTProto.pbInt(5, Integer.MAX_VALUE));
+        byte[] sub = YTProto.pbInt(2, Integer.MAX_VALUE);
+        sub = YTProto.concat(sub, YTProto.pbInt(3, 1000));
+        p = YTProto.concat(p, YTProto.pbMsg(6, sub));
+        return p;
+    }
+
+    /**
+     * Preferred audio formats (field 16): the selected audio first when it is an opus (itag 250/251),
+     * then every opus in the pool, deduped by itag, capped at 8. Falls back to the whole pool when
+     * the response carries no opus at all.
+     */
+    static List<byte[]> buildPreferredAudioFormatIds(Config cfg, YTFormat selectedAudio) {
+        List<byte[]> out = new ArrayList<>();
+        List<YTFormat> pool = cfg.audioPool;
+        if (pool == null || pool.isEmpty()) return out;
+        java.util.HashSet<Long> seen = new java.util.HashSet<>();
+        if (selectedAudio != null && (selectedAudio.itag == 250 || selectedAudio.itag == 251)) {
+            out.add(buildFormatId(selectedAudio, false));
+            seen.add((long) selectedAudio.itag);
+        }
+        for (YTFormat f : pool) {
+            if (out.size() >= 8) break;
+            if (f == null || (f.itag != 250 && f.itag != 251)) continue;
+            if (!seen.add((long) f.itag)) continue;
+            out.add(buildFormatId(f, false));
+        }
+        if (out.isEmpty()) {
+            for (YTFormat f : pool) {
+                if (out.size() >= 8) break;
+                if (f == null || f.itag == 0 || !seen.add((long) f.itag)) continue;
+                out.add(buildFormatId(f, false));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Preferred video formats (field 17): the selected video first, then same-codec-family
+     * formats from the pool, capped at 6 total.
+     */
+    static List<byte[]> buildPreferredVideoFormatIds(Config cfg, YTFormat selected) {
+        List<byte[]> out = new ArrayList<>();
+        List<YTFormat> pool = cfg.videoPool;
+        if (pool == null || pool.isEmpty()) return out;
+        String family = selected == null ? null : codecFamily(selected.codecs);
+        if (selected != null && selected.itag != 0) {
+            out.add(buildFormatId(selected, true));
+        }
+        for (YTFormat f : pool) {
+            if (out.size() >= 6) break;
+            if (f == null || f.itag == 0 || (selected != null && f.itag == selected.itag)) continue;
+            String fFamily = codecFamily(f.codecs);
+            if (family == null || fFamily == null || !family.equals(fFamily)) continue;
+            out.add(buildFormatId(f, true));
+        }
+        return out;
+    }
+
+    /** Codec family tag ("av01"/"vp09"/"avc1"/"hvc1"...) used to group preferred video formats. */
+    private static String codecFamily(String codecs) {
+        if (codecs == null) return null;
+        String c = codecs.toLowerCase(Locale.US).trim();
+        if (c.isEmpty()) return null;
+        int cut = c.length();
+        for (int i = 0; i < c.length(); i++) {
+            char ch = c.charAt(i);
+            if (ch == '.' || ch == ' ' || ch == ',') { cut = i; break; }
+        }
+        String family = c.substring(0, cut);
+        return "vp9".equals(family) ? "vp09" : family;
     }
 
     /**
