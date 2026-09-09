@@ -31,6 +31,7 @@ final class YoutubeLogin {
     static final String ACTION_STATUS = "yt_oauth_status";
     static final String ACTION_LOGOUT = "yt_oauth_logout";
     static final String ACTION_COPY = "yt_oauth_copy";
+    static final String ACTION_QR = "yt_oauth_qr";
 
     private YoutubeLogin() {
     }
@@ -46,7 +47,8 @@ final class YoutubeLogin {
 
     static boolean isAction(String action) {
         return ACTION_LOGIN.equals(action) || ACTION_STATUS.equals(action)
-                || ACTION_LOGOUT.equals(action) || ACTION_COPY.equals(action);
+                || ACTION_LOGOUT.equals(action) || ACTION_COPY.equals(action)
+                || ACTION_QR.equals(action);
     }
 
     /* ------------------------------------------------------------------ */
@@ -68,9 +70,13 @@ final class YoutubeLogin {
             return Result.get().vod(list).page(1, 1, list.size(), list.size()).string();
         }
         String code = device == null ? "" : device.userCode;
+        // The QR goes in a dialog this JAR builds. The poster route was verified to be fetched and
+        // served correctly (host logged status=200 mime=image/png bytes=2940) and still drew nothing,
+        // because this host does not render posters on action cards.
+        if (device != null) YoutubeDialog.showQr(device.qrTarget(), code);
         String pic = device == null ? "" : YoutubeQr.url(siteKey, device.qrTarget(), code);
-        list.add(card(TextUtils.isEmpty(code) ? "扫码登录" : "扫码登录  " + code,
-                "手机扫码；不显示二维码则用下面的验证码", pic, ACTION_STATUS));
+        list.add(card(TextUtils.isEmpty(code) ? "显示二维码" : "显示二维码  " + code,
+                "点此弹出二维码，手机扫码授权", pic, ACTION_QR));
         list.add(card(TextUtils.isEmpty(code) ? "复制验证码" : "复制验证码  " + code,
                 "在手机浏览器打开 youtube.com/activate 后粘贴", "", ACTION_COPY));
         list.add(card("我已授权，检查状态", "授权后点此确认", "", ACTION_STATUS));
@@ -94,6 +100,12 @@ final class YoutubeLogin {
                 return Result.notify("取码失败: " + (device == null ? "unknown" : device.error));
             }
             return Result.notify("验证码 " + device.userCode + "，返回上一页刷新二维码");
+        }
+        if (ACTION_QR.equals(action)) {
+            YoutubeOAuth.Device device = YoutubeOAuth.pending();
+            if (device == null) return Result.notify("验证码已失效，请点「重新获取验证码」");
+            YoutubeDialog.showQr(device.qrTarget(), device.userCode);
+            return Result.notify("验证码 " + device.userCode);
         }
         if (ACTION_COPY.equals(action)) {
             YoutubeOAuth.Device device = YoutubeOAuth.pending();
