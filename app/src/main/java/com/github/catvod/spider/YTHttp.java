@@ -29,7 +29,6 @@ import okhttp3.Response;
  */
 final class YTHttp {
 
-    private static final MediaType PROTOBUF = MediaType.get("application/x-protobuf");
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
     private final OkHttpClient client;
@@ -254,12 +253,14 @@ final class YTHttp {
         if (m.find()) target = m.replaceFirst(m.group(1) + "rn=" + rn);
         else target = url + (url.contains("?") ? "&" : "?") + "rn=" + rn;
         Map<String, String> merged = new HashMap<>();
-        merged.put("Content-Type", "application/x-protobuf");
+        // pg.jar posts UMP bodies with RequestBody.create(body, null) — no Content-Type header at
+        // all. The anonymous line worked with application/x-protobuf, but the OAuth endpoint is
+        // pickier, so match pg.jar byte-for-byte and send none.
         merged.put("Accept", "application/vnd.yt-ump");
         // Identity encoding keeps UMP framing byte-exact for the streaming parser.
         merged.put("Accept-Encoding", "identity");
         if (headers != null) merged.putAll(headers);
-        Request request = request(target, merged).post(RequestBody.create(payload, PROTOBUF)).build();
+        Request request = request(target, merged).post(RequestBody.create(payload, null)).build();
         // Deliberately no callTimeout. callTimeout bounds the WHOLE call including streaming the UMP
         // body, so an 8s deadline aborted perfectly healthy responses as soon as one pump returned
         // several large segments at once (observed: completed=5 at 2160p, then

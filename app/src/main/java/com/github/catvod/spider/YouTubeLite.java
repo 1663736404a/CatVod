@@ -216,8 +216,9 @@ class YouTubeLite {
         if (visitorData == null) visitorData = YoutubeVisitor.resolve(config, ytcfg, initialPr);
         Integer sts = extractSignatureTimestamp(playerUrl);
         session.bind(visitorData, sts);
+        // Build tag so device logs always identify which spider revision produced them.
         SpiderDebug.log("YouTube 播放线路: " + (authenticated ? "OAuth 登录（免 poToken）" : "匿名（需 poToken）")
-                + " vid=" + videoId);
+                + " vid=" + videoId + " build=" + YTSabr.BUILD_TAG);
 
         JsonObject context = ytcfg.has("INNERTUBE_CONTEXT")
                 ? ytcfg.getAsJsonObject("INNERTUBE_CONTEXT")

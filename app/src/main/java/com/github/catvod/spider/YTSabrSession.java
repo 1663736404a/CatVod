@@ -1385,6 +1385,11 @@ class YTSabrSession {
                 target = YTSabr.enhanceSabrUrl(target, cfg.cpn,
                         cfg.clientInfo == null ? null : cfg.clientInfo.clientVersion);
             }
+            if (rn == 1) {
+                // One-shot dump of the opening URL: param presence (cpn/cver/alr/rqh) is the
+                // first thing to check when the server rejects the session.
+                SpiderDebug.log("YouTube SABR 首请求 URL: " + target);
+            }
             YTHttp.Result response = http.postSabr(target, payload, headers, rn);
             requestCount = rn;
             lastAbrAccessMs = System.currentTimeMillis();
@@ -1394,7 +1399,19 @@ class YTSabrSession {
             int completed = 0;
             try {
                 if (response.code != 200) {
-                    throw new Exception("SABR HTTP " + response.code + " client=" + cfg.clientName);
+                    // googlevideo error bodies usually name the rejection reason; without it a
+                    // bare 403 is unactionable.
+                    String errBody = "";
+                    try {
+                        okhttp3.ResponseBody eb = response.raw.body();
+                        if (eb != null) {
+                            String text = eb.string();
+                            errBody = text.length() > 300 ? text.substring(0, 300) : text;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    throw new Exception("SABR HTTP " + response.code + " client=" + cfg.clientName
+                            + (errBody.isEmpty() ? "" : " body=" + errBody));
                 }
                 InputStream in = response.raw.body() == null ? null : response.raw.body().byteStream();
                 if (in == null) throw new Exception("SABR empty body");
