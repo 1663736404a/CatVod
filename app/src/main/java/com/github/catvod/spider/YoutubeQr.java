@@ -1,7 +1,6 @@
 package com.github.catvod.spider;
 
 import android.graphics.Bitmap;
-import android.util.Base64;
 
 import com.github.catvod.crawler.SpiderDebug;
 import com.google.zxing.BarcodeFormat;
@@ -10,15 +9,19 @@ import com.google.zxing.common.BitMatrix;
 import com.google.zxing.qrcode.QRCodeWriter;
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Renders a QR code as a {@code data:image/png;base64} URL.
+ * Renders the login QR code as a PNG served through the spider's own proxy route.
  *
- * <p>Used as a poster image on the login card, which is the only way to show the user something
- * scannable: a Spider has no UI of its own, and a card poster is rendered by every host.
+ * <p>A card poster is the only place a Spider can show something scannable, since it owns no UI.
+ * The image is delivered as a proxy URL rather than a {@code data:} URL because hosts feed posters
+ * to an image loader that generally only understands http(s): with a data URL the card rendered
+ * blank even though the PNG was generated correctly (observed in webhtv, where the emitted
+ * {@code vod_pic} held a valid base64 PNG and nothing appeared).
  */
 final class YoutubeQr {
 
@@ -28,8 +31,26 @@ final class YoutubeQr {
     private YoutubeQr() {
     }
 
-    /** @return a data URL, or {@code null} when encoding fails. */
-    static String dataUrl(String text) {
+    /** Proxy URL of the QR image for {@code text}. The {@code v} param busts the poster cache. */
+    static String url(String siteKey, String text, String version) {
+        if (text == null || text.isEmpty()) return "";
+        return Proxy.getUrl(siteKey, "&type=yt_qr&v=" + android.net.Uri.encode(version == null ? "0" : version));
+    }
+
+    /** Answers the {@code yt_qr} proxy route with a PNG, or {@code null} when nothing is pending. */
+    static Object[] proxy() {
+        YoutubeOAuth.Device device = YoutubeOAuth.pending();
+        if (device == null) return null;
+        byte[] png = png(device.qrTarget());
+        if (png == null) return null;
+        Map<String, String> headers = new HashMap<>();
+        // The code changes between authorisations, so a cached poster must not be reused.
+        headers.put("Cache-Control", "no-store");
+        return new Object[]{200, "image/png", new ByteArrayInputStream(png), headers};
+    }
+
+    /** @return PNG bytes, or {@code null} when encoding fails. */
+    static byte[] png(String text) {
         if (text == null || text.isEmpty()) return null;
         try {
             Map<EncodeHintType, Object> hints = new HashMap<>();
@@ -51,7 +72,7 @@ final class YoutubeQr {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
             bitmap.recycle();
-            return "data:image/png;base64," + Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
+            return out.toByteArray();
         } catch (Throwable e) {
             SpiderDebug.log("YouTube 二维码生成失败: " + e);
             return null;

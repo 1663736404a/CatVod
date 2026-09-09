@@ -114,7 +114,7 @@ public class YouTube extends Spider {
 
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
-        if (YoutubeLogin.handles(tid)) return YoutubeLogin.page();
+        if (YoutubeLogin.handles(tid)) return YoutubeLogin.page(siteKey);
         int page = parsePage(pg);
         String query = YTCatalog.keyword(tid, extend);
         List<YTParse.Item> items = searchPage(query, page);
@@ -218,6 +218,9 @@ public class YouTube extends Spider {
 
     @Override
     public Object[] proxy(Map<String, String> params) {
+        // The login QR poster is answered here, before playback routing: it is not media and it must
+        // work even when no YTPlay session exists yet.
+        if ("yt_qr".equals(params.get("type"))) return YoutubeQr.proxy();
         return youtubeProxy == null ? null : youtubeProxy.handle(params);
     }
 
