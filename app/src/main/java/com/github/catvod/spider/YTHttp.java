@@ -13,6 +13,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
+import okhttp3.FormBody;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -132,6 +133,53 @@ final class YTHttp {
             return response.body().string();
         } catch (Throwable e) {
             return "";
+        }
+    }
+
+    /** A text response plus the {@code Set-Cookie} values, which OAuth's TV bootstrap needs. */
+    static final class Text {
+        int code;
+        String body = "";
+        java.util.List<String> cookies = new java.util.ArrayList<>();
+    }
+
+    /**
+     * Posts {@code application/x-www-form-urlencoded}, as the OAuth device and token endpoints
+     * require. Errors are returned as the response body rather than thrown, because the OAuth flow
+     * treats {@code authorization_pending} (HTTP 428) as a normal polling answer.
+     */
+    String postForm(String url, Map<String, String> form, Map<String, String> headers) {
+        if (closed) return "";
+        FormBody.Builder body = new FormBody.Builder();
+        if (form != null) {
+            for (Map.Entry<String, String> entry : form.entrySet()) {
+                if (entry.getKey() == null || entry.getValue() == null) continue;
+                body.add(entry.getKey(), entry.getValue());
+            }
+        }
+        try (Response response = client.newCall(request(url, headers).post(body.build()).build()).execute()) {
+            return response.body() == null ? "" : response.body().string();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    /** Posts JSON and keeps the response headers, unlike {@link #postJson}. */
+    Text postJsonText(String url, String json, Map<String, String> headers) {
+        if (closed) return null;
+        Map<String, String> merged = new HashMap<>();
+        merged.put("Content-Type", "application/json");
+        merged.put("Origin", "https://www.youtube.com");
+        if (headers != null) merged.putAll(headers);
+        Request request = request(url, merged).post(RequestBody.create(json, JSON)).build();
+        try (Response response = client.newCall(request).execute()) {
+            Text result = new Text();
+            result.code = response.code();
+            result.body = response.body() == null ? "" : response.body().string();
+            result.cookies = response.headers("set-cookie");
+            return result;
+        } catch (Throwable e) {
+            return null;
         }
     }
 

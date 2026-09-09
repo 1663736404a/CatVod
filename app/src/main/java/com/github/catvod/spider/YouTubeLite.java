@@ -179,10 +179,19 @@ class YouTubeLite {
     }
 
     private Extracted extractLocked(String videoId, boolean forceRefresh) throws Exception {
-        return extractLocked(videoId, forceRefresh, true);
+        Extracted result = extractLocked(videoId, forceRefresh, true, YoutubeOAuth.loggedIn());
+        // A signed-in session that yields nothing playable (revoked grant, an account restriction on
+        // this video, a TV endpoint hiccup) must not be a dead end: fall back to the anonymous
+        // BotGuard route once, which is exactly the behaviour before login existed.
+        if (result.sabrFormats.isEmpty() && result.formats.isEmpty() && YoutubeOAuth.loggedIn()) {
+            SpiderDebug.log("YouTube 登录线路无可用格式，回退匿名线路: vid=" + videoId);
+            return extractLocked(videoId, true, true, false);
+        }
+        return result;
     }
 
-    private Extracted extractLocked(String videoId, boolean forceRefresh, boolean retryToken) throws Exception {
+    private Extracted extractLocked(String videoId, boolean forceRefresh, boolean retryToken,
+                                    boolean authenticated) throws Exception {
         CacheEntry cached = extractCache.get(videoId);
         long now = System.currentTimeMillis();
         if (cached != null && cached.expires > now) {
@@ -199,9 +208,16 @@ class YouTubeLite {
         JsonObject initialPr = extractJsonAfter(page, "ytInitialPlayerResponse");
         String playerUrl = extractPlayerUrl(page);
         String apiKey = optString(ytcfg, "INNERTUBE_API_KEY", search(RE_API_KEY, page));
-        String visitorData = YoutubeVisitor.resolve(config, ytcfg, initialPr);
+        // Signed in: prefer the visitor id issued by the authenticated TV bootstrap so the player
+        // response, the SABR session and the account are one identity. The anonymous resolver stays
+        // as the fallback for a cold start or a failed bootstrap.
+        String visitorData = null;
+        if (authenticated) visitorData = YoutubeOAuth.visitorData();
+        if (visitorData == null) visitorData = YoutubeVisitor.resolve(config, ytcfg, initialPr);
         Integer sts = extractSignatureTimestamp(playerUrl);
         session.bind(visitorData, sts);
+        SpiderDebug.log("YouTube 播放线路: " + (authenticated ? "OAuth 登录（免 poToken）" : "匿名（需 poToken）")
+                + " vid=" + videoId);
 
         JsonObject context = ytcfg.has("INNERTUBE_CONTEXT")
                 ? ytcfg.getAsJsonObject("INNERTUBE_CONTEXT")
@@ -224,7 +240,7 @@ class YouTubeLite {
             responses.add(initialPr);
         }
         if (!TextUtils.isEmpty(apiKey)) {
-            responses.addAll(callPlayerApi(videoId, apiKey, context, watchUrl, visitorData, sts));
+            responses.addAll(callPlayerApi(videoId, apiKey, context, watchUrl, visitorData, sts, authenticated));
         }
 
         JsonObject best = null;
@@ -281,13 +297,16 @@ class YouTubeLite {
         result.hlsUrl = hlsUrl;
         result.dashUrl = dashUrl;
         result.playerUrl = playerUrl;
-        extractFormats(responses, playerUrl, result);
-        if (result.sabrFormats.isEmpty() && retryToken && visitorData != null) {
+        extractFormats(responses, playerUrl, result, authenticated);
+        // The retry below exists to give BotGuard a second chance. On the OAuth path no token is
+        // minted, so an empty result means something else went wrong and retrying only doubles the
+        // latency.
+        if (result.sabrFormats.isEmpty() && retryToken && !authenticated && visitorData != null) {
             // BotGuard/WebView can time out once while the visitor binding is still valid. Retry
             // the same serialized extraction once with a fresh token before exposing formats=0.
             SpiderDebug.log("YouTube TVHTML5 SABR 为空，重试 visitor-bound poToken: vid=" + videoId);
             session.retryToken();
-            return extractLocked(videoId, true, false);
+            return extractLocked(videoId, true, false, false);
         }
 
         // Do not cache a transient BotGuard timeout as a valid extraction. A later A/B request
@@ -346,8 +365,14 @@ class YouTubeLite {
         }
     }
 
-    private String poToken(String clientName) {
-        return YoutubePlayer.CLIENT.equals(clientName) ? session.poToken() : null;
+    /**
+     * @param authenticated the mode of the extraction in progress, not the global login state. The
+     *                      anonymous fallback runs while the user is still signed in and does need a
+     *                      BotGuard token, so this must not be read from {@link YoutubeOAuth}.
+     */
+    private String poToken(String clientName, boolean authenticated) {
+        if (!YoutubePlayer.CLIENT.equals(clientName)) return null;
+        return authenticated ? session.configuredToken() : session.poToken();
     }
 
     /* ------------------------------------------------------------------ */
@@ -359,7 +384,8 @@ class YouTubeLite {
     }
 
     private List<JsonObject> callPlayerApi(String videoId, String apiKey, JsonObject webContext,
-                                           String referer, String visitorData, Integer sts) {
+                                           String referer, String visitorData, Integer sts,
+                                           boolean authenticated) {
         List<JsonObject> clients = new ArrayList<>();
         String version = optString(config, "tvhtml5_client_version", "7.20250312.16.00");
         String ua = optString(config, "tvhtml5_user_agent", "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
@@ -394,7 +420,7 @@ class YouTubeLite {
                 payload.add("playbackContext", playbackCtx);
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
-                String token = poToken(clientName);
+                String token = poToken(clientName, authenticated);
                 if (!TextUtils.isEmpty(token)) {
                     JsonObject integrity = new JsonObject();
                     integrity.addProperty("poToken", token);
@@ -409,11 +435,17 @@ class YouTubeLite {
                 if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
                 String clientUa = optString(client, "userAgent", null);
                 if (clientUa != null) reqHeaders.put("User-Agent", clientUa);
+                // Bearer + TV referer. This is what makes the response's playback cookie an
+                // authenticated credential, which is what lets SABR run without a poToken.
+                if (authenticated) YoutubeOAuth.apply(reqHeaders);
 
                 String body = http.postJson(url, payload.toString(), reqHeaders);
                 JsonObject data = Json.safeObject(body);
                 JsonObject sd = traverseObject(data, "streamingData");
                 if (sd == null || sd.size() == 0) continue;
+                if (authenticated) {
+                    YoutubeOAuth.rememberVisitor(traverseString(data, "responseContext", "visitorData"));
+                }
 
                 data.addProperty("_client_name", clientName);
                 if (clientUa != null) data.addProperty("_client_ua", clientUa);
@@ -445,7 +477,8 @@ class YouTubeLite {
     /* formats                                                            */
     /* ------------------------------------------------------------------ */
 
-    private void extractFormats(List<JsonObject> responses, String playerUrl, Extracted out) {
+    private void extractFormats(List<JsonObject> responses, String playerUrl, Extracted out,
+                                boolean authenticated) {
         Set<String> seenDirect = new HashSet<>();
         Set<String> seenSabr = new HashSet<>();
         // Keep watch-page metadata, but only accept SABR representations from the TVHTML5
@@ -480,7 +513,7 @@ class YouTubeLite {
                         + "|" + optString(raw, "url", cipher == null ? optString(raw, "mimeType", "") : cipher);
                 if (!seenDirect.contains(directKey)) {
                     seenDirect.add(directKey);
-                    YTFormat item = normalizeFormat(raw, playerUrl, clientName, clientUa);
+                    YTFormat item = normalizeFormat(raw, playerUrl, clientName, clientUa, authenticated);
                     if (item != null && !TextUtils.isEmpty(item.url)) out.formats.add(item);
                 }
                 if (!TextUtils.isEmpty(serverAbrUrl) && !TextUtils.isEmpty(ustreamerConfig)) {
@@ -489,7 +522,7 @@ class YouTubeLite {
                     if (!seenSabr.contains(sabrKey)) {
                         seenSabr.add(sabrKey);
                         YTFormat sabrItem = normalizeSabrFormat(raw, serverAbrUrl, ustreamerConfig,
-                                clientName, clientUa, clientInfo);
+                                clientName, clientUa, clientInfo, authenticated);
                         if (sabrItem != null) out.sabrFormats.add(sabrItem);
                     }
                 }
@@ -517,7 +550,8 @@ class YouTubeLite {
         }
     }
 
-    private YTFormat normalizeFormat(JsonObject fmt, String playerUrl, String clientName, String clientUa) {
+    private YTFormat normalizeFormat(JsonObject fmt, String playerUrl, String clientName, String clientUa,
+                                     boolean authenticated) {
         String mediaUrl = optString(fmt, "url", null);
         if (mediaUrl == null) {
             String cipher = optString(fmt, "signatureCipher", optString(fmt, "cipher", null));
@@ -525,7 +559,7 @@ class YouTubeLite {
         }
         if (TextUtils.isEmpty(mediaUrl)) return null;
         mediaUrl = syncNParam(mediaUrl);
-        String token = clientName == null ? null : poToken(clientName);
+        String token = clientName == null ? null : poToken(clientName, authenticated);
         if (!TextUtils.isEmpty(token)) {
             mediaUrl = mediaUrl + (mediaUrl.contains("?") ? "&" : "?") + "pot=" + Uri.encode(token);
         }
@@ -559,7 +593,8 @@ class YouTubeLite {
     }
 
     private YTFormat normalizeSabrFormat(JsonObject fmt, String serverAbrUrl, String ustreamerConfig,
-                                         String clientName, String clientUa, JsonObject clientInfoJson) {
+                                         String clientName, String clientUa, JsonObject clientInfoJson,
+                                         boolean authenticated) {
         String mime = optString(fmt, "mimeType", "");
         String codecs = search(RE_CODECS, mime);
         if (codecs == null) codecs = "";
@@ -594,7 +629,8 @@ class YouTubeLite {
         cfg.videoPlaybackUstreamerConfig = ustreamerConfig;
         cfg.clientName = clientName;
         cfg.clientInfo = toClientInfo(clientInfoJson, clientName, clientUa);
-        cfg.poToken = clientName == null ? null : poToken(clientName);
+        cfg.poToken = clientName == null ? null : poToken(clientName, authenticated);
+        cfg.authenticated = authenticated;
         cfg.itag = itag;
         cfg.xtags = optString(fmt, "xtags", null);
         cfg.lastModified = optString(fmt, "lastModified", null);

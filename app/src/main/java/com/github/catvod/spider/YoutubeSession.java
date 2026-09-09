@@ -30,6 +30,17 @@ final class YoutubeSession {
         this.signatureTimestamp = signatureTimestamp;
     }
 
+    /**
+     * The token from the site config, without minting one.
+     *
+     * <p>Used on the OAuth path: the authenticated session already carries its own integrity proof,
+     * so a WebView/BotGuard round trip would be pure latency on every extraction. A token the user
+     * configured explicitly is still passed along, because that is them asking for it.
+     */
+    synchronized String configuredToken() {
+        return visitorData == null ? null : poTokens.get(YoutubePlayer.CLIENT, visitorData);
+    }
+
     synchronized String poToken() {
         if (visitorData == null) return null;
         long now = System.currentTimeMillis();

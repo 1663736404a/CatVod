@@ -24,7 +24,13 @@ final class YoutubePlayer {
         return "https://www.youtube.com/watch?v=" + Uri.encode(videoId);
     }
 
-    static boolean ready(String visitorData, Integer sts, String poToken) {
-        return !TextUtils.isEmpty(visitorData) && sts != null && !TextUtils.isEmpty(poToken);
+    /**
+     * @param authenticated true when the player request carried an OAuth bearer token, in which
+     *                      case the server-issued playback cookie replaces the poToken as the
+     *                      integrity signal and no token is required.
+     */
+    static boolean ready(String visitorData, Integer sts, String poToken, boolean authenticated) {
+        if (TextUtils.isEmpty(visitorData) || sts == null) return false;
+        return authenticated || !TextUtils.isEmpty(poToken);
     }
 }

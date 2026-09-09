@@ -56,6 +56,8 @@ final class YTSabr {
         String clientName;
         ClientInfo clientInfo;
         String poToken;
+        /** True when the player response was fetched with an OAuth bearer token. */
+        boolean authenticated;
         int itag;
         String xtags;
         String lastModified;

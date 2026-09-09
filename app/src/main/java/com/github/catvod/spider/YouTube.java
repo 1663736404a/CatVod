@@ -74,6 +74,9 @@ public class YouTube extends Spider {
         this.play = new YTPlay(yt, header, ext, siteKey);
         this.session = new YoutubeSession(context, ext);
         this.youtubeProxy = new YoutubeProxy(play);
+        // Sign-in traffic must follow the same proxy as everything else, otherwise login fails
+        // wherever youtube.com is only reachable through it.
+        YoutubeOAuth.attach(http);
     }
 
     /** Reads the {@code proxy} extend value, accepting either a bare host:port or an object. */
@@ -94,6 +97,11 @@ public class YouTube extends Spider {
     @Override
     public String homeContent(boolean filter) {
         List<Class> classes = YTCatalog.classes();
+        // The login page is a category because a Spider has no UI of its own. It stays last so it
+        // never displaces content, and its name reflects the current state.
+        if (!YouTubeLite.optBool(ext, "hide_login")) {
+            classes.add(new Class(YoutubeLogin.TID, YoutubeLogin.title()));
+        }
         if (!filter) return Result.string(classes, new ArrayList<>());
         LinkedHashMap<String, List<Filter>> filters = YTCatalog.filters();
         return Result.string(classes, filters);
@@ -106,6 +114,7 @@ public class YouTube extends Spider {
 
     @Override
     public String categoryContent(String tid, String pg, boolean filter, HashMap<String, String> extend) {
+        if (YoutubeLogin.handles(tid)) return YoutubeLogin.page();
         int page = parsePage(pg);
         String query = YTCatalog.keyword(tid, extend);
         List<YTParse.Item> items = searchPage(query, page);
@@ -210,6 +219,13 @@ public class YouTube extends Spider {
     @Override
     public Object[] proxy(Map<String, String> params) {
         return youtubeProxy == null ? null : youtubeProxy.handle(params);
+    }
+
+    /** Card taps on the login page arrive here; anything else is not ours. */
+    @Override
+    public String action(String action) {
+        if (!YoutubeLogin.isAction(action)) return "";
+        return YoutubeLogin.action(action);
     }
 
     @Override
