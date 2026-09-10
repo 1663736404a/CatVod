@@ -133,6 +133,10 @@ class YTSabrSession {
     /** Last decoded STREAM_PROTECTION_STATUS (UMP part 58); logged whenever it changes. */
     private Integer lastProtectionStatus;
 
+    /** Ordered googlevideo CDN candidates advertised by the server's mn query parameter. */
+    private final List<String> cdnCandidates = new ArrayList<>();
+    private int cdnIndex;
+
     private final Map<String, byte[]> initialized = new LinkedHashMap<>();
     private final Map<String, Buffered> buffered = new LinkedHashMap<>();
     private final Map<Long, Partial> partial = new HashMap<>();
@@ -1329,6 +1333,82 @@ class YTSabrSession {
     /* transport                                                          */
     /* ------------------------------------------------------------------ */
 
+    /** Rebuilds the ordered CDN list from the URL's mn parameter. */
+    private void updateCdnCandidates(String source) {
+        if (source == null || source.isEmpty()) return;
+        try {
+            java.net.URI uri = java.net.URI.create(source);
+            String host = uri.getHost();
+            if (host == null || !host.endsWith(".googlevideo.com")) return;
+            if (!cdnCandidates.isEmpty()) {
+                try {
+                    String currentHost = java.net.URI.create(cdnCandidates.get(cdnIndex)).getHost();
+                    if (host.equalsIgnoreCase(currentHost)) return;
+                } catch (Throwable ignored) {
+                    cdnCandidates.clear();
+                    cdnIndex = 0;
+                }
+            }
+            int sep = host.indexOf("---");
+            String mn = null;
+            String rawQuery = uri.getRawQuery();
+            if (rawQuery != null) {
+                for (String item : rawQuery.split("&")) {
+                    int eq = item.indexOf('=');
+                    String key = eq < 0 ? item : item.substring(0, eq);
+                    key = java.net.URLDecoder.decode(key, "UTF-8");
+                    if ("mn".equals(key)) {
+                        mn = eq < 0 ? "" : java.net.URLDecoder.decode(item.substring(eq + 1), "UTF-8");
+                        break;
+                    }
+                }
+            }
+            if (sep < 0 || mn == null || mn.isEmpty()) return;
+            String prefix = host.substring(0, sep);
+            String authority = uri.getRawAuthority();
+            int port = uri.getPort();
+            cdnCandidates.clear();
+            cdnCandidates.add(source);
+            for (String network : mn.split(",")) {
+                if (!network.matches("[A-Za-z0-9-]+")) continue;
+                String candidateHost = prefix + "---" + network + ".googlevideo.com";
+                if (candidateHost.equalsIgnoreCase(host)) continue;
+                String candidateAuthority = candidateHost + (port >= 0 ? ":" + port : "");
+                int at = source.indexOf(authority);
+                if (at < 0) continue;
+                String candidate = source.substring(0, at) + candidateAuthority
+                        + source.substring(at + authority.length());
+                if (!cdnCandidates.contains(candidate)) cdnCandidates.add(candidate);
+            }
+            cdnIndex = 0;
+        } catch (Throwable ignored) {
+            // A malformed optional mn parameter must not break SABR playback.
+        }
+    }
+
+    /** Advances to the next advertised CDN when the current host failed. */
+    private boolean advanceCdn(String failedUrl) {
+        if (cdnCandidates.isEmpty()) updateCdnCandidates(failedUrl);
+        if (cdnCandidates.isEmpty()) return false;
+        String failedHost = null;
+        try { failedHost = java.net.URI.create(failedUrl).getHost(); } catch (Throwable ignored) { }
+        if (failedHost == null) return false;
+        int failedIndex = -1;
+        for (int i = 0; i < cdnCandidates.size(); i++) {
+            try {
+                if (failedHost.equalsIgnoreCase(java.net.URI.create(cdnCandidates.get(i)).getHost())) {
+                    failedIndex = i;
+                    break;
+                }
+            } catch (Throwable ignored) { }
+        }
+        if (failedIndex < 0 || failedIndex > cdnIndex || cdnIndex + 1 >= cdnCandidates.size()) return false;
+        if (failedIndex == cdnIndex) cdnIndex++;
+        String next = cdnCandidates.get(cdnIndex);
+        if (url != null) url = next;
+        return true;
+    }
+
     /** Issues one SABR request and commits every segment it completes. */
     private void pumpOnce(YTSabr.Config cfg, YTFormat videoItem, YTFormat audioItem) throws Exception {
         if (canceled) throw new IOException("Canceled: SABR session closed");
@@ -1357,6 +1437,7 @@ class YTSabrSession {
         if (target == null || target.indexOf("n=") < 0) {
             throw new Exception("SABR missing solved server URL");
         }
+        updateCdnCandidates(target);
         Integer videoItag = videoItem == null || videoItem.itag == 0 ? null : videoItem.itag;
         Integer audioItag = audioItem == null || audioItem.itag == 0 ? null : audioItem.itag;
         SpiderDebug.log("YouTube SABR 请求准备: client=" + cfg.clientName + ", videoItag="
