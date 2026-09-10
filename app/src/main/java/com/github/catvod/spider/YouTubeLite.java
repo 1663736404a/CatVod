@@ -421,13 +421,16 @@ class YouTubeLite {
     }
 
     /**
-     * @param authenticated the mode of the extraction in progress, not the global login state. The
-     *                      anonymous fallback runs while the user is still signed in and does need a
-     *                      BotGuard token, so this must not be read from {@link YoutubeOAuth}.
+     * Mints the visitor-bound integrity token, on the signed-in route as well.
+     *
+     * <p>Signing in adds an account identity (the Bearer token on the player request); it does not
+     * replace the integrity proof googlevideo wants on the SABR request. Skipping BotGuard here is
+     * what made every OAuth playback attempt fail with a bare 403 while the anonymous route, which
+     * differed only by carrying a token, streamed the same video fine.
      */
-    private String poToken(String clientName, boolean authenticated) {
+    private String poToken(String clientName) {
         if (!YoutubePlayer.CLIENT.equals(clientName)) return null;
-        return authenticated ? session.configuredToken() : session.poToken();
+        return session.poToken();
     }
 
     /* ------------------------------------------------------------------ */
@@ -531,7 +534,7 @@ class YouTubeLite {
                 payload.add("playbackContext", playbackCtx);
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
-                String token = poToken(clientName, authenticated);
+                String token = poToken(clientName);
                 if (!TextUtils.isEmpty(token)) {
                     JsonObject integrity = new JsonObject();
                     integrity.addProperty("poToken", token);
@@ -727,7 +730,7 @@ class YouTubeLite {
         }
         if (TextUtils.isEmpty(mediaUrl)) return null;
         mediaUrl = syncNParam(mediaUrl);
-        String token = clientName == null ? null : poToken(clientName, authenticated);
+        String token = clientName == null ? null : poToken(clientName);
         if (!TextUtils.isEmpty(token)) {
             mediaUrl = mediaUrl + (mediaUrl.contains("?") ? "&" : "?") + "pot=" + Uri.encode(token);
         }
@@ -812,7 +815,7 @@ class YouTubeLite {
         cfg.videoPlaybackUstreamerConfig = ustreamerConfig;
         cfg.clientName = clientName;
         cfg.clientInfo = toClientInfo(clientInfoJson, clientName, clientUa);
-        cfg.poToken = clientName == null ? null : poToken(clientName, authenticated);
+        cfg.poToken = clientName == null ? null : poToken(clientName);
         cfg.authenticated = authenticated;
         cfg.itag = itag;
         cfg.xtags = optString(fmt, "xtags", null);
