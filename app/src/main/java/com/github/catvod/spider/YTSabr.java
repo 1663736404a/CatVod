@@ -20,7 +20,7 @@ final class YTSabr {
 
     /* UMP part ids */
     /** Bumped with every pushed change; logged on every playback so device logs identify the build. */
-    static final String BUILD_TAG = "2026-09-10.2-cpn-diag";
+    static final String BUILD_TAG = "2026-09-10.3-403-demote";
     static final int MEDIA_HEADER = 20;
     static final int MEDIA = 21;
     static final int MEDIA_END = 22;

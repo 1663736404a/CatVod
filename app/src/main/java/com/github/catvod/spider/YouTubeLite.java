@@ -178,12 +178,43 @@ class YouTubeLite {
         }
     }
 
+    /**
+     * Videos whose SABR session the CDN refused on the signed-in line. The next extraction for one
+     * of these skips OAuth and goes straight to the anonymous BotGuard route.
+     *
+     * <p>Needed because the OAuth player response itself succeeds — status OK, formats present,
+     * serverAbrStreamingUrl present — and only the SABR transport is refused. Without this marker
+     * the anonymous fallback in {@link #extractLocked(String, boolean)} never fires, since it only
+     * looks at whether the player response produced formats.
+     */
+    private final Set<String> authDemoted = Collections.synchronizedSet(new HashSet<>());
+
+    /**
+     * Marks a video as unplayable on the signed-in line so the next extract uses the anonymous one.
+     *
+     * @return true when this call changed the state, i.e. a retry is worth attempting.
+     */
+    boolean demoteAuthenticated(String urlOrId) {
+        if (!YoutubeOAuth.loggedIn()) return false;
+        String videoId;
+        try {
+            videoId = extractVideoId(urlOrId);
+        } catch (Throwable e) {
+            videoId = urlOrId;
+        }
+        if (videoId == null || !authDemoted.add(videoId)) return false;
+        SpiderDebug.log("YouTube 登录线路被 CDN 拒绝，本次改走匿名线路: vid=" + videoId);
+        invalidateExtract(videoId);
+        return true;
+    }
+
     private Extracted extractLocked(String videoId, boolean forceRefresh) throws Exception {
-        Extracted result = extractLocked(videoId, forceRefresh, true, YoutubeOAuth.loggedIn());
+        boolean authenticated = YoutubeOAuth.loggedIn() && !authDemoted.contains(videoId);
+        Extracted result = extractLocked(videoId, forceRefresh, true, authenticated);
         // A signed-in session that yields nothing playable (revoked grant, an account restriction on
         // this video, a TV endpoint hiccup) must not be a dead end: fall back to the anonymous
         // BotGuard route once, which is exactly the behaviour before login existed.
-        if (result.sabrFormats.isEmpty() && result.formats.isEmpty() && YoutubeOAuth.loggedIn()) {
+        if (result.sabrFormats.isEmpty() && result.formats.isEmpty() && authenticated) {
             SpiderDebug.log("YouTube 登录线路无可用格式，回退匿名线路: vid=" + videoId);
             return extractLocked(videoId, true, true, false);
         }

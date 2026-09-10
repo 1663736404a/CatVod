@@ -1308,6 +1308,19 @@ final class YTPlay {
                 data = rebuilt;
                 item = "video".equals(track) ? data.videoItem : data.audioItem;
                 stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
+            } catch (YTSabrSession.SessionRejected rejected) {
+                // Same verdict as the A bridge: the credential, not the video, is refused. Demote
+                // to the anonymous line and rebuild once.
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 会话被拒绝: track=" + track
+                        + ", attempt=" + attempt + ", reason=" + rejected.getMessage());
+                if (attempt > 0 || !yt.demoteAuthenticated(vid)) {
+                    return text(503, "SABR-B 会话被拒绝: " + rejected.getMessage());
+                }
+                SabrData rebuilt = reextract(vid, quality, cacheKey);
+                if (rebuilt == null) return text(503, "SABR-B 会话被拒绝且回退失败");
+                data = rebuilt;
+                item = "video".equals(track) ? data.videoItem : data.audioItem;
+                stateKey = data.stateKey == null ? vid + ":sabr:b" : data.stateKey;
             } catch (Throwable e) {
                 com.github.catvod.crawler.SpiderDebug.log("YouTube SABR-B 取段失败: track=" + track
                         + ", segment=" + segment + ", status=" + session(stateKey).lastStatus()
@@ -1412,6 +1425,24 @@ final class YTPlay {
                 headers.put("Cache-Control", "private, max-age=30");
                 headers.put("Accept-Ranges", "none");
                 return bytes(200, contentType, found.media, headers);
+            } catch (YTSabrSession.SessionRejected rejected) {
+                // Every advertised CDN refused this session's credential. On the signed-in line
+                // that verdict belongs to the OAuth identity, not to the video, so drop the login
+                // preference for this extraction and rebuild on the anonymous BotGuard line, which
+                // mints a poToken the CDN does accept.
+                lastError = String.valueOf(rejected.getMessage());
+                com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 会话被拒绝: track=" + track
+                        + ", segment=" + segment + ", error=" + lastError);
+                if (rebuilt || !yt.demoteAuthenticated(vid)) {
+                    return text(503, "SABR 会话被拒绝: " + lastError);
+                }
+                rebuilt = true;
+                resetSabr(vid, cacheKey);
+                SabrData fresh = sabrData(vid, quality, cacheKey, true);
+                if (fresh == null) return text(503, "SABR 会话被拒绝且回退失败: " + lastError);
+                data = fresh;
+                attempts = Math.max(attempts, 1 + fresh.candidates.size());
+                continue;
             } catch (Throwable e) {
                 lastError = String.valueOf(e);
                 com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 取段失败: track=" + track

@@ -111,6 +111,20 @@ class YTSabrSession {
         }
     }
 
+    /**
+     * Raised when googlevideo refuses this SABR session outright (a bare HTTP 403 with an empty
+     * body, repeated on every advertised CDN host).
+     *
+     * <p>Distinct from {@link ReloadRequired}: a reload re-runs the same authenticated line with a
+     * fresh player response, which cannot help when it is the credential itself the CDN rejects.
+     * The caller answers this by re-extracting on the anonymous BotGuard line instead.
+     */
+    static class SessionRejected extends Exception {
+        SessionRejected(String message) {
+            super(message);
+        }
+    }
+
     /** True when this session can no longer produce media and must be rebuilt by the caller. */
     boolean needsReload() {
         return reloadRequested;
@@ -136,6 +150,15 @@ class YTSabrSession {
     /** Ordered googlevideo CDN candidates advertised by the server's mn query parameter. */
     private final List<String> cdnCandidates = new ArrayList<>();
     private int cdnIndex;
+    /** Hosts that answered a bare 403; once every candidate is in here the session is rejected. */
+    private final Set<String> rejectedHosts = new HashSet<>();
+    /** Set when every CDN refused this session, so waiting consumers can fail fast. */
+    private volatile String rejectedReason;
+
+    /** True when the CDN refused this session outright and no retry can succeed. */
+    boolean isRejected() {
+        return rejectedReason != null;
+    }
 
     private final Map<String, byte[]> initialized = new LinkedHashMap<>();
     private final Map<String, Buffered> buffered = new LinkedHashMap<>();
@@ -389,7 +412,8 @@ class YTSabrSession {
             }
         }
         long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
-        while (!canceled && !reloadRequested && System.currentTimeMillis() < deadline) {
+        while (!canceled && !reloadRequested && rejectedReason == null
+                && System.currentTimeMillis() < deadline) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) break;
             if (!lock.tryLock(Math.min(100L, remaining), TimeUnit.MILLISECONDS)) continue;
@@ -412,6 +436,9 @@ class YTSabrSession {
             }
         }
         if (reloadRequested) throw new ReloadRequired("SABR session needs a fresh player response");
+        // Surface the rejection instead of a generic timeout: only this distinction lets the caller
+        // pick the anonymous line rather than rebuilding the same refused session.
+        if (rejectedReason != null) throw new SessionRejected(rejectedReason);
         Found timeout = new Found();
         timeout.error = canceled ? "producer canceled" : "producer target timeout";
         timeout.targetMs = targetMs;
@@ -489,6 +516,16 @@ class YTSabrSession {
                 // Nothing this producer can do: the session needs a new player response, which only
                 // the caller can obtain. Stop instead of hammering a dead payload.
                 SpiderDebug.log("YouTube SABR-B producer 需重新提取, 退出: " + reload.getMessage());
+                synchronized (producerMonitor) {
+                    producerMonitor.notifyAll();
+                }
+                return;
+            } catch (SessionRejected rejected) {
+                // The CDN refuses this session's credential on every host. Retrying is guaranteed
+                // to reproduce the same 403, so record it and stop; the consumer surfaces it to the
+                // caller, which re-extracts on another line.
+                rejectedReason = rejected.getMessage();
+                SpiderDebug.log("YouTube SABR-B producer 会话被拒绝, 退出: " + rejectedReason);
                 synchronized (producerMonitor) {
                     producerMonitor.notifyAll();
                 }
@@ -1386,6 +1423,17 @@ class YTSabrSession {
         }
     }
 
+    /** @return the host of a URL, or the raw string when it cannot be parsed. */
+    private static String hostOf(String value) {
+        if (value == null) return "";
+        try {
+            String host = java.net.URI.create(value).getHost();
+            return host == null ? "" : host;
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     /** Advances to the next advertised CDN when the current host failed. */
     private boolean advanceCdn(String failedUrl) {
         if (cdnCandidates.isEmpty()) updateCdnCandidates(failedUrl);
@@ -1457,7 +1505,12 @@ class YTSabrSession {
         if (videoItag != null) targetItags.add(videoItag);
         if (audioItag != null) targetItags.add(audioItag);
 
-        for (int redirectAttempt = 0; redirectAttempt < 4; redirectAttempt++) {
+        // The budget covers SABR redirects plus one CDN failover per advertised host. It is
+        // recomputed each iteration because updateCdnCandidates only fills the list once the first
+        // response has been seen; a fixed bound taken up front would cut the failover short.
+        // Termination is still guaranteed: advanceCdn only ever moves cdnIndex forward and returns
+        // false at the end of the list, which raises SessionRejected.
+        for (int redirectAttempt = 0; redirectAttempt < 4 + cdnCandidates.size(); redirectAttempt++) {
             long rn = requestCount + 1;
             if (cfg.authenticated) {
                 // pg.jar re-runs R.s.b on every request, so redirect URLs get the session
@@ -1490,6 +1543,22 @@ class YTSabrSession {
                             errBody = text.length() > 300 ? text.substring(0, 300) : text;
                         }
                     } catch (Throwable ignored) {
+                    }
+                    // A 403 is the CDN refusing this session's credential, not a transport hiccup:
+                    // it is returned before any UMP framing, with Content-Length 0. Retrying the
+                    // same payload — on this host or the next advertised one — reproduces it
+                    // exactly, so once every candidate has answered 403 the session is declared
+                    // rejected and the caller can demote to a line that still works.
+                    if (response.code == 403) {
+                        rejectedHosts.add(hostOf(target));
+                        if (!advanceCdn(target)) {
+                            throw new SessionRejected("SABR HTTP 403 client=" + cfg.clientName
+                                    + " hosts=" + rejectedHosts.size()
+                                    + (errBody.isEmpty() ? "" : " body=" + errBody));
+                        }
+                        target = url;
+                        SpiderDebug.log("YouTube SABR 403 换 CDN 重试: host=" + hostOf(target));
+                        continue;
                     }
                     throw new Exception("SABR HTTP " + response.code + " client=" + cfg.clientName
                             + (errBody.isEmpty() ? "" : " body=" + errBody));

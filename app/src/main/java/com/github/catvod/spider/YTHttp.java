@@ -101,8 +101,19 @@ final class YTHttp {
     }
 
     private Request.Builder request(String url, Map<String, String> headers) {
+        return request(url, headers, true);
+    }
+
+    /**
+     * @param withBase false to send exactly {@code headers}. The SABR endpoint is fingerprinted on
+     *                 its header set, and the spider's base headers (a Chrome UA, a zh-CN
+     *                 Accept-Language, a watch-page Referer) contradict the Cobalt/Starboard
+     *                 identity the ABR request declares. Merging them produced a request no real
+     *                 client sends, which is one thing the CDN can answer with a bare 403.
+     */
+    private Request.Builder request(String url, Map<String, String> headers, boolean withBase) {
         Request.Builder builder = new Request.Builder().url(url);
-        Map<String, String> merged = new HashMap<>(baseHeaders);
+        Map<String, String> merged = withBase ? new HashMap<>(baseHeaders) : new HashMap<>();
         if (headers != null) merged.putAll(headers);
         for (Map.Entry<String, String> entry : merged.entrySet()) {
             if (entry.getKey() == null || entry.getValue() == null) continue;
@@ -260,7 +271,11 @@ final class YTHttp {
         // Identity encoding keeps UMP framing byte-exact for the streaming parser.
         merged.put("Accept-Encoding", "identity");
         if (headers != null) merged.putAll(headers);
-        Request request = request(target, merged).post(RequestBody.create(payload, null)).build();
+        // Send only these headers. The base set belongs to the watch-page/InnerTube requests and
+        // would otherwise override the Cobalt UA and add a zh-CN Accept-Language the TV client
+        // never sends, leaving the ABR request with a self-contradicting fingerprint.
+        Request request = request(target, merged, false)
+                .post(RequestBody.create(payload, null)).build();
         // Deliberately no callTimeout. callTimeout bounds the WHOLE call including streaming the UMP
         // body, so an 8s deadline aborted perfectly healthy responses as soon as one pump returned
         // several large segments at once (observed: completed=5 at 2160p, then
