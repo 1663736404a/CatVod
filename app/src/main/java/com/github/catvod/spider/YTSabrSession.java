@@ -1434,27 +1434,33 @@ class YTSabrSession {
         }
     }
 
-    /** Advances to the next advertised CDN when the current host failed. */
-    private boolean advanceCdn(String failedUrl) {
+    /**
+     * Advances to the next advertised CDN when the current host failed.
+     *
+     * @return the next candidate URL, or {@code null} when every candidate has been tried.
+     *
+     * <p>Returns the URL rather than only mutating {@link #url}: that field is assigned solely on a
+     * SABR redirect, so on a session that never redirected it is still null and the caller has to
+     * take the new target from here.
+     */
+    private String advanceCdn(String failedUrl) {
         if (cdnCandidates.isEmpty()) updateCdnCandidates(failedUrl);
-        if (cdnCandidates.isEmpty()) return false;
-        String failedHost = null;
-        try { failedHost = java.net.URI.create(failedUrl).getHost(); } catch (Throwable ignored) { }
-        if (failedHost == null) return false;
+        if (cdnCandidates.isEmpty()) return null;
+        String failedHost = hostOf(failedUrl);
+        if (failedHost.isEmpty()) return null;
         int failedIndex = -1;
         for (int i = 0; i < cdnCandidates.size(); i++) {
-            try {
-                if (failedHost.equalsIgnoreCase(java.net.URI.create(cdnCandidates.get(i)).getHost())) {
-                    failedIndex = i;
-                    break;
-                }
-            } catch (Throwable ignored) { }
+            if (failedHost.equalsIgnoreCase(hostOf(cdnCandidates.get(i)))) {
+                failedIndex = i;
+                break;
+            }
         }
-        if (failedIndex < 0 || failedIndex > cdnIndex || cdnIndex + 1 >= cdnCandidates.size()) return false;
+        if (failedIndex < 0 || failedIndex > cdnIndex || cdnIndex + 1 >= cdnCandidates.size()) return null;
         if (failedIndex == cdnIndex) cdnIndex++;
         String next = cdnCandidates.get(cdnIndex);
-        if (url != null) url = next;
-        return true;
+        // Keep the session pointed at the new host so later pumps and redirects continue from it.
+        url = next;
+        return next;
     }
 
     /** Issues one SABR request and commits every segment it completes. */
@@ -1551,12 +1557,13 @@ class YTSabrSession {
                     // rejected and the caller can demote to a line that still works.
                     if (response.code == 403) {
                         rejectedHosts.add(hostOf(target));
-                        if (!advanceCdn(target)) {
+                        String next = advanceCdn(target);
+                        if (next == null) {
                             throw new SessionRejected("SABR HTTP 403 client=" + cfg.clientName
                                     + " hosts=" + rejectedHosts.size()
                                     + (errBody.isEmpty() ? "" : " body=" + errBody));
                         }
-                        target = url;
+                        target = next;
                         SpiderDebug.log("YouTube SABR 403 换 CDN 重试: host=" + hostOf(target));
                         continue;
                     }
