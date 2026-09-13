@@ -53,6 +53,8 @@ import javax.crypto.spec.SecretKeySpec;
 final class YoutubePoTokenSo {
 
     private static final String SO_NAME = "libpot.so";
+    /** GetByteArrayRegion in the library is capped at 0x300 bytes. */
+    private static final int MAX_CHALLENGE_BYTES = 0x300;
     /** Ships libpot.so per ABI; used only as an additional library source when installed. */
     private static final String HELPER_PACKAGE = "app.morphe.pot.helper";
     /** ABIs carried in this JAR, in the order they are worth trying. */
@@ -579,46 +581,26 @@ final class YoutubePoTokenSo {
     }
 
     /**
-     * Builds the challenge the native minter decodes.
+     * The payload handed to the native minter.
      *
-     * <p>In PotHelper these bytes arrive from the GMS PoTokens service, so their exact shape is
-     * not established from public source. The library decodes them with nanopb into its
-     * {@code Challenge} message, and the visitor binding is what the GVS token must be tied to,
-     * so the identifier is passed as field 1. If a build turns out to need the original proto,
-     * capture one real call and return those bytes here instead; see docs/potoken-so.md.
+     * <p>Disassembling {@code mintMorpheIntegrityTokens} (va 0x2174) shows the library does not
+     * expect a Challenge protobuf from the caller. It builds that structure itself: a 224-byte
+     * blob at va 0x10b8 is copied onto the stack before anything else, a second 32-byte blob at
+     * va 0x1402 follows, and only then is the caller's array read with {@code GetByteArrayRegion}
+     * and copied into one field of that structure. The read is capped at 0x300 bytes
+     * ({@code cmp w0, #0x300}), so the argument is a bounded payload, not a message.
+     *
+     * <p>Wrapping the identifier in a length-delimited field, as an earlier version did, therefore
+     * fed {@code pb_decode} two extra bytes of framing it never asked for. The binding identifier
+     * is passed raw.
      */
     private static byte[] buildChallenge(String visitorData) {
         byte[] identifier = visitorData.getBytes(StandardCharsets.UTF_8);
-        byte[] header = tag(1, identifier.length);
-        byte[] out = new byte[header.length + identifier.length];
-        System.arraycopy(header, 0, out, 0, header.length);
-        System.arraycopy(identifier, 0, out, header.length, identifier.length);
-        return out;
+        // The library truncates anything past 768 bytes; keep the call honest about that.
+        if (identifier.length <= MAX_CHALLENGE_BYTES) return identifier;
+        byte[] capped = new byte[MAX_CHALLENGE_BYTES];
+        System.arraycopy(identifier, 0, capped, 0, MAX_CHALLENGE_BYTES);
+        return capped;
     }
 
-    /** Length-delimited protobuf tag plus length, both varint encoded. */
-    private static byte[] tag(int field, int length) {
-        byte[] key = varint((field << 3) | 2);
-        byte[] size = varint(length);
-        byte[] out = new byte[key.length + size.length];
-        System.arraycopy(key, 0, out, 0, key.length);
-        System.arraycopy(size, 0, out, key.length, size.length);
-        return out;
-    }
-
-    private static byte[] varint(long value) {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(10);
-        long remaining = value;
-        while (true) {
-            int b = (int) (remaining & 0x7f);
-            remaining >>>= 7;
-            if (remaining != 0) {
-                out.write(b | 0x80);
-            } else {
-                out.write(b);
-                break;
-            }
-        }
-        return out.toByteArray();
-    }
 }

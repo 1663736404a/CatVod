@@ -6,9 +6,15 @@ import android.text.TextUtils;
 final class YoutubeSabr {
     private YoutubeSabr() {}
 
-    static String validate(YTSabr.Config config) {
+    /**
+     * @param expectedClient the client the player response was requested as; SABR state belongs to
+     *                       that identity, so a response from any other client is not usable here.
+     */
+    static String validate(YTSabr.Config config, String expectedClient) {
         if (config == null) return "missing-config";
-        if (!YoutubePlayer.CLIENT.equals(config.clientName)) return "not-tvhtml5";
+        if (expectedClient == null || !expectedClient.equals(config.clientName)) {
+            return "client-mismatch:" + (config.clientName == null ? "none" : config.clientName);
+        }
         if (TextUtils.isEmpty(config.serverAbrStreamingUrl)) return "missing-server-abr-url";
         if (TextUtils.isEmpty(config.videoPlaybackUstreamerConfig)) return "missing-ustreamer-config";
         if (config.clientInfo == null || !YoutubeVisitor.usable(config.clientInfo.visitorData)) return "missing-visitor-data";

@@ -92,6 +92,8 @@ class YouTubeLite {
     private final Map<String, String> headers;
     private final JsonObject config;
     private final YoutubeSession session;
+    /** Client used for the player call; the minted token is bound to its package name. */
+    private final String playerClient;
     private final Map<String, String> playerCache = new HashMap<>();
     private final Map<String, Extracted> extractCacheData = new HashMap<>();
     private final Map<String, CacheEntry> extractCache = new HashMap<>();
@@ -121,6 +123,7 @@ class YouTubeLite {
         this.headers = headers == null ? new HashMap<>() : headers;
         this.config = config == null ? new JsonObject() : config;
         // The offline minter performs no I/O; the client is passed for call-site compatibility.
+        this.playerClient = YoutubePlayer.client(this.config);
         this.session = new YoutubeSession(context, this.config, http);
         this.extractCacheTtl = optLong(this.config, "extract_cache_ttl", 300);
     }
@@ -336,7 +339,7 @@ class YouTubeLite {
     }
 
     private String poToken(String clientName) {
-        return YoutubePlayer.CLIENT.equals(clientName) ? session.poToken() : null;
+        return playerClient.equals(clientName) ? session.poToken() : null;
     }
 
     /* ------------------------------------------------------------------ */
@@ -346,18 +349,26 @@ class YouTubeLite {
     private List<JsonObject> callPlayerApi(String videoId, String apiKey, JsonObject webContext,
                                            String referer, String visitorData, Integer sts) {
         List<JsonObject> clients = new ArrayList<>();
-        String version = optString(config, "tvhtml5_client_version", "7.20250312.16.00");
-        String ua = optString(config, "tvhtml5_user_agent", "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
-                + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15");
-        JsonObject tv = new JsonObject();
-        JsonObject tvClient = new JsonObject();
-        tvClient.addProperty("clientName", "TVHTML5");
-        tvClient.addProperty("clientVersion", version);
-        tvClient.addProperty("userAgent", ua);
-        tvClient.addProperty("hl", "en");
-        tvClient.addProperty("gl", "US");
-        tv.add("client", tvClient);
-        clients.add(tv);
+        String version = YoutubePlayer.version(config);
+        String ua = YoutubePlayer.userAgent(config);
+        JsonObject ctxRoot = new JsonObject();
+        JsonObject clientJson = new JsonObject();
+        clientJson.addProperty("clientName", playerClient);
+        clientJson.addProperty("clientVersion", version);
+        clientJson.addProperty("userAgent", ua);
+        clientJson.addProperty("hl", "en");
+        clientJson.addProperty("gl", "US");
+        if (YoutubePlayer.CLIENT_ANDROID.equals(playerClient)) {
+            // The Android client is identified by its platform fields as well as the header pair;
+            // omitting them makes the response fall back to a web-shaped payload without
+            // serverAbrStreamingUrl.
+            clientJson.addProperty("androidSdkVersion", Integer.parseInt(YoutubePlayer.ANDROID_SDK));
+            clientJson.addProperty("osName", "Android");
+            clientJson.addProperty("osVersion", YoutubePlayer.ANDROID_OS_VERSION);
+            clientJson.addProperty("platform", "MOBILE");
+        }
+        ctxRoot.add("client", clientJson);
+        clients.add(ctxRoot);
 
         List<JsonObject> results = new ArrayList<>();
         for (JsonObject ctx : clients) {
@@ -366,17 +377,23 @@ class YouTubeLite {
             String clientName = optString(client, "clientName", null);
             try {
                 String url = "https://www.youtube.com/youtubei/v1/player?key=" + apiKey + "&prettyPrint=false";
-                JsonObject playbackCtx = new JsonObject();
-                JsonObject contentCtx = new JsonObject();
-                contentCtx.addProperty("html5Preference", "HTML5_PREF_WANTS");
-                if (sts != null) contentCtx.addProperty("signatureTimestamp", sts);
-                playbackCtx.add("contentPlaybackContext", contentCtx);
+                final boolean isAndroid = YoutubePlayer.CLIENT_ANDROID.equals(clientName);
 
                 if (visitorData != null) client.addProperty("visitorData", visitorData);
                 JsonObject payload = new JsonObject();
                 payload.add("context", ctx);
                 payload.addProperty("videoId", videoId);
-                payload.add("playbackContext", playbackCtx);
+                // html5Preference and signatureTimestamp belong to the HTML5 players. The Android
+                // client does not ask for a signature timestamp, and sending one marks the request
+                // as inconsistent with the identity it claims.
+                if (!isAndroid) {
+                    JsonObject playbackCtx = new JsonObject();
+                    JsonObject contentCtx = new JsonObject();
+                    contentCtx.addProperty("html5Preference", "HTML5_PREF_WANTS");
+                    if (sts != null) contentCtx.addProperty("signatureTimestamp", sts);
+                    playbackCtx.add("contentPlaybackContext", contentCtx);
+                    payload.add("playbackContext", playbackCtx);
+                }
                 payload.addProperty("contentCheckOk", true);
                 payload.addProperty("racyCheckOk", true);
                 String token = poToken(clientName);
@@ -387,8 +404,11 @@ class YouTubeLite {
                 }
 
                 Map<String, String> reqHeaders = new HashMap<>();
-                reqHeaders.put("Origin", "https://www.youtube.com");
-                reqHeaders.put("Referer", referer);
+                // The app client posts without browser origin headers.
+                if (!isAndroid) {
+                    reqHeaders.put("Origin", "https://www.youtube.com");
+                    reqHeaders.put("Referer", referer);
+                }
                 reqHeaders.put("X-YouTube-Client-Name", String.valueOf(clientNameId(clientName)));
                 reqHeaders.put("X-YouTube-Client-Version", optString(client, "clientVersion", ""));
                 if (visitorData != null) reqHeaders.put("X-Goog-Visitor-Id", visitorData);
@@ -564,9 +584,9 @@ class YouTubeLite {
         cfg.xtags = optString(fmt, "xtags", null);
         cfg.lastModified = optString(fmt, "lastModified", null);
         cfg.targetDurationSec = optLong(fmt, "targetDurationSec", 0);
-        String error = YoutubeSabr.validate(cfg);
+        String error = YoutubeSabr.validate(cfg, playerClient);
         if (error != null) {
-            SpiderDebug.log("YouTube TVHTML5 SABR 条件失败: " + error);
+            SpiderDebug.log("YouTube SABR 条件失败(" + playerClient + "): " + error);
             return null;
         }
         item.sabrConfig = cfg;

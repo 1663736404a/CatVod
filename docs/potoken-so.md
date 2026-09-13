@@ -72,15 +72,57 @@ ABI 选择以 `Build.SUPPORTED_ABIS` 为准，其后补上 JAR 内携带的四�
 - `PoTokenSo: JAR 内无 lib/<abi>/libpot.so` —— 设备 ABI 不在打包范围内
 - `PoTokenSo 失败: mint 输出不完整` —— so 已加载但 challenge 不被接受，见下
 
-## challenge 的已知限制
+## 逆向结论：so 实际需要什么
 
-PotHelper 里喂给 so 的字节来自 GMS PoTokens 服务，公开源码无法确认其确切结构
-（`libpot.so` 用 nanopb 解 `Challenge_msg`，导出符号只有
-`Java_app_morphe_pot_helper_potokens_PoTokenServiceImpl_mintMorpheIntegrityTokens`）。
-本分支按 field 1 传 `visitorData` 作为绑定标识。
+反汇编 `mintMorpheIntegrityTokens`（va 0x2174，1124 字节）得到的调用约定：
 
-若日志停在 `mint 输出不完整`，或 SABR 报 `missing-visitor-bound-potoken`，说明需要真实
-challenge。抓一次真实调用后把字节写回 `YoutubePoTokenSo.buildChallenge`：
+```
+0x2198  adr x9, 0x10b8              加载内嵌 224 字节 blob
+0x21c0  stp q0,q1 ...×8             blob 复制进栈上 Challenge 结构
+0x226c  pb_istream_from_buffer      用传入 byte[] 建输入流
+0x2280  pb_decode(Challenge_msg)    解析；失败直接 return null
+0x22ac  GetArrayLength(data)
+0x22c4  cmp w0, #0x300              入参上限 768 字节，超出截断
+0x22e8  GetByteArrayRegion          拷入 Challenge 的一个字段
+0x22f0  strncpy("com.google.android.youtube", 64)   写入固定包名
+0x230c  adr x9, 0x1402              第二段 32 字节 blob
+0x2354  pb_ostream_from_buffer(1024)
+0x2368  pb_encode(Descriptor_msg)
+0x2374~ NewByteArray ×3 + NewObjectArray → byte[3][1][]
+```
+
+三点由此确定：
+
+1. **入参不是完整 Challenge proto**。结构由 so 自己用内嵌 blob 拼好，传入的 `byte[]` 只填其中
+   一个字段，所以标识符按裸 UTF-8 传，不要再包一层 tag/length。
+2. **密钥材料内嵌**。0x10b8 的 224 字节与 0x1402 的 32 字节是固定数据，配合 `.rodata` 里的
+   `type.googleapis.com/google.crypto.tink.AesGcmKey`，说明 rawKey 由 so 自带。
+3. **包名硬编码为 `com.google.android.youtube`**。token 声明自己来自 Android YouTube 客户端。
+
+## 客户端身份必须与 token 一致
+
+因为第 3 点，播放请求要以 `ANDROID` 客户端发出，否则 token 声明的身份与请求身份不符。之前以
+`TVHTML5` 请求时的表现正符合这种不符：UMP part 58（`STREAM_PROTECTION_STATUS`）从 2 字节变成
+4 字节，随后服务端只回控制帧、不再回媒体（`completed=0`），配合 part 35 下发 2 秒退避。
+
+默认客户端因此是 `ANDROID`。`ext.player_client` 可切回 `TVHTML5` 作对照：
+
+```json
+{
+  "player_client": "ANDROID",
+  "android_client_version": "20.10.38",
+  "android_user_agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip"
+}
+```
+
+以 `ANDROID` 请求时不发送 `playbackContext`（`html5Preference` / `signatureTimestamp` 属于
+HTML5 播放器），也不发送 `Origin` / `Referer`，并补上 `androidSdkVersion` / `osName` /
+`osVersion` / `platform`，让请求形状与声明的身份匹配。
+
+## 若仍被拒绝
+
+日志出现 `SABR 条件失败(ANDROID): missing-visitor-bound-potoken`，或 part 58 仍从 2 变 4 后停发，
+说明包名之外还有绑定项未对齐。下一步是抓一次真实调用的入参对照：
 
 ```
 frida -U -n com.google.android.youtube -e '
@@ -88,9 +130,6 @@ Interceptor.attach(Module.findExportByName("libpot.so",
   "Java_app_morphe_pot_helper_potokens_PoTokenServiceImpl_mintMorpheIntegrityTokens"),
   { onEnter(args) { /* dump args[2] 指向的 jbyteArray */ } });'
 ```
-
-静态路径：`Ghidra` 打开 `libpot.so`，从 `0x2174` 的导出函数跟 `Challenge_field_info`
-反推字段号，再用 protobuf 手拼。
 
 ## JNI 类名约束
 
