@@ -107,6 +107,10 @@ final class YoutubePoTokenSo {
             }
             byte[] encrypted = encrypt(rawKey, data);
             if (encrypted == null || encrypted.length == 0) return null;
+            // Diagnostic: the Tink key the library returns is also the key the payload was
+            // encrypted with, so the plaintext descriptor can be recovered here. This is what a
+            // pure-Java implementation has to reproduce, so log its shape once.
+            dumpDescriptor(rawKey, encrypted);
             byte[] proto = new PoTokenResult(new IntegrityToken(encrypted, tokenData)).toByteArray();
             if (proto == null || proto.length == 0) {
                 SpiderDebug.log("PoTokenSo 失败: 序列化为空");
@@ -616,6 +620,72 @@ final class YoutubePoTokenSo {
         } catch (Throwable error) {
             SpiderDebug.log("PoTokenSo 失败: 加密 " + error);
             return null;
+        }
+    }
+
+
+    /**
+     * Decrypts the payload this class just produced and logs the protobuf field layout.
+     *
+     * <p>Only runs while the descriptor is being reverse engineered: the encryption key comes from
+     * the library itself, so the plaintext is available to us, and its field numbers are what a
+     * Java-only minter must emit. Logged as field/length pairs rather than raw bytes, so a token is
+     * never written to the log.
+     */
+    private static void dumpDescriptor(byte[] rawKey, byte[] encrypted) {
+        try {
+            if (encrypted == null || encrypted.length < 34) return;
+            Pair<Integer, SecretKeySpec> keyPair = KeySet.parseFrom(rawKey).getKeyPair();
+            // Layout is [0x01][keyId 4B][IV 12B][ciphertext][GCM tag 16B].
+            byte[] iv = new byte[12];
+            System.arraycopy(encrypted, 5, iv, 0, 12);
+            byte[] body = new byte[encrypted.length - 17];
+            System.arraycopy(encrypted, 17, body, 0, body.length);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, keyPair.second, new IvParameterSpec(iv));
+            byte[] plain = cipher.doFinal(body);
+            StringBuilder shape = new StringBuilder();
+            int index = 0;
+            while (index < plain.length) {
+                int tagByte = plain[index] & 0xFF;
+                int field = tagByte >>> 3;
+                int wire = tagByte & 7;
+                index++;
+                if (wire == 2) {
+                    int length = 0, shift = 0;
+                    while (index < plain.length) {
+                        int b = plain[index++] & 0xFF;
+                        length |= (b & 0x7F) << shift;
+                        if ((b & 0x80) == 0) break;
+                        shift += 7;
+                    }
+                    shape.append(" f").append(field).append("=bytes[").append(length).append(']');
+                    // A short value is likely a marker rather than a payload; show it.
+                    if (length <= 32 && index + length <= plain.length) {
+                        shape.append('(');
+                        for (int i = 0; i < length; i++) {
+                            shape.append(String.format("%02x", plain[index + i]));
+                        }
+                        shape.append(')');
+                    }
+                    index += length;
+                } else if (wire == 0) {
+                    long value = 0; int shift = 0;
+                    while (index < plain.length) {
+                        int b = plain[index++] & 0xFF;
+                        value |= ((long) (b & 0x7F)) << shift;
+                        if ((b & 0x80) == 0) break;
+                        shift += 7;
+                    }
+                    shape.append(" f").append(field).append("=varint(").append(value).append(')');
+                } else {
+                    shape.append(" f").append(field).append("=wire").append(wire).append("STOP");
+                    break;
+                }
+            }
+            SpiderDebug.log("PoTokenSo descriptor: total=" + plain.length + shape);
+        } catch (Throwable error) {
+            SpiderDebug.log("PoTokenSo descriptor dump failed: " + error);
         }
     }
 
