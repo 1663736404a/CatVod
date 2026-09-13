@@ -772,25 +772,24 @@ final class YTPlay {
                     } else {
                         long start = Math.max(0L, meta.startMs);
                         long end = start + Math.max(1L, meta.durationMs);
-                        // Deliver the segment to every window it covers, rather than to the single
-                        // window its start rounds up to.
-                        //
-                        // A native segment only lines up with the window grid when its duration is a
-                        // multiple of the window. itag 248 happens to satisfy that (5000ms segments,
-                        // 1000ms windows), but 2160p does not: itag 315 segments are 5333ms, so their
-                        // starts drift off the grid and land mid-window (observed start=1109167).
-                        // Requiring an exact match then made five of every six window requests
-                        // resolve to nothing, and the player stalled while SABR kept fetching
-                        // normally — which is why the network stayed busy with no picture.
-                        if (start < winStart + winMs && end > winStart) {
+                        long owner = ((start + winMs - 1) / winMs) * winMs;
+                        if (owner >= end) {
+                            // Shorter than a window: its owner boundary lies past the segment, so no
+                            // window request could ever resolve to it there. Use the window that
+                            // contains the start instead.
+                            owner = (start / winMs) * winMs;
+                            com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
+                                    + " 分片短于窗口 start=" + start + " dur=" + meta.durationMs
+                                    + " 改用起点窗 " + owner);
+                        }
+                        if (owner == winStart) {
                             com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
                                     + " 交付分片 start=" + start + " dur=" + meta.durationMs
                                     + " 字节=" + payload.length);
                         } else {
                             payload = new byte[0];
                             com.github.catvod.crawler.SpiderDebug.log("YouTube 微片 " + tag
-                                    + " 空200(分片 start=" + start + " end=" + end
-                                    + " 未覆盖窗 [" + winStart + "," + (winStart + winMs) + "))");
+                                    + " 空200(分片 start=" + start + " 归属窗 " + owner + ")");
                         }
                     }
                 }
