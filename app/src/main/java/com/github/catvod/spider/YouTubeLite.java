@@ -230,11 +230,10 @@ class YouTubeLite {
         }
 
         JsonObject best = null;
-        // TVHTML5 is the only client in this implementation that is allowed to supply the
-        // full-length SABR response. Do not let the watch-page WEB_INITIAL response win merely
-        // because it appears first in the list.
+        // Only the player client is allowed to supply the full-length SABR response. Do not let
+        // the watch-page WEB_INITIAL response win merely because it appears first in the list.
         for (JsonObject response : responses) {
-            if ("TVHTML5".equals(optString(response, "_client_name", ""))
+            if (playerClient.equals(optString(response, "_client_name", ""))
                     && "OK".equals(traverseString(response, "playabilityStatus", "status"))) {
                 best = response;
                 break;
@@ -287,7 +286,7 @@ class YouTubeLite {
         if (result.sabrFormats.isEmpty() && retryToken && visitorData != null) {
             // A mint can fail once while the visitor binding is still valid. Retry
             // the same serialized extraction once with a fresh token before exposing formats=0.
-            SpiderDebug.log("YouTube TVHTML5 SABR 为空，重试 visitor-bound poToken: vid=" + videoId);
+            SpiderDebug.log("YouTube " + playerClient + " SABR 为空，重试 visitor-bound poToken: vid=" + videoId);
             session.retryToken();
             return extractLocked(videoId, true, false);
         }
@@ -453,11 +452,12 @@ class YouTubeLite {
     private void extractFormats(List<JsonObject> responses, String playerUrl, Extracted out) {
         Set<String> seenDirect = new HashSet<>();
         Set<String> seenSabr = new HashSet<>();
-        // Keep watch-page metadata, but only accept SABR representations from the TVHTML5
-        // player response. Mixing WEB/ANDROID entries here breaks the TVHTML5-bound session.
+        // Keep watch-page metadata, but only accept SABR representations from the player client's
+        // response. Mixing other clients' entries here breaks the session, whose state is bound to
+        // one identity.
         for (JsonObject response : responses) {
             if (response == null) continue;
-            if (!"TVHTML5".equals(optString(response, "_client_name", ""))) continue;
+            if (!playerClient.equals(optString(response, "_client_name", ""))) continue;
             JsonObject sd = traverseObject(response, "streamingData");
             if (sd == null) continue;
             List<JsonObject> rawList = new ArrayList<>();

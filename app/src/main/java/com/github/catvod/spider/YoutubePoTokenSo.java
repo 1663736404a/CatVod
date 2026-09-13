@@ -232,7 +232,8 @@ final class YoutubePoTokenSo {
             files.add(configured.isDirectory() ? new File(configured, SO_NAME) : configured);
         }
         if (context != null) {
-            files.add(new File(context.getFilesDir(), "catvod_pot/" + SO_NAME));
+            // Not the staged copy under catvod_pot: that path is per-ClassLoader now and is
+            // handled by extractFromJar, which knows the right file name.
             File external = context.getExternalFilesDir(null);
             if (external != null) files.add(new File(external, SO_NAME));
             files.addAll(helperLibraries());
@@ -260,8 +261,8 @@ final class YoutubePoTokenSo {
     private File stagedIfNeeded(File source) {
         if (context == null) return source;
         String path = source.getAbsolutePath();
-        File dir = context.getFilesDir();
-        if (dir != null && path.startsWith(dir.getAbsolutePath())) return source;
+        // Anything already carrying this loader's file name is ready to open as-is.
+        if (source.getName().equals(libraryFileName())) return source;
         // A helper's nativeLibraryDir is already extracted and executable.
         if (path.contains("/" + HELPER_PACKAGE + "-") || path.contains("/" + HELPER_PACKAGE + "/")) {
             return source;
@@ -271,8 +272,9 @@ final class YoutubePoTokenSo {
 
     private File stage(File source) {
         try {
-            File target = new File(privateDir(), SO_NAME);
-            if (target == null) return null;
+            File dir = privateDir();
+            if (dir == null) return null;
+            File target = new File(dir, libraryFileName());
             // Re-copy whenever the source changed, so replacing the file takes effect.
             if (target.isFile() && target.length() == source.length()
                     && target.lastModified() >= source.lastModified()) {
@@ -307,8 +309,11 @@ final class YoutubePoTokenSo {
         }
         File jarFile = new File(jar);
         if (!jarFile.isFile()) return null;
-        File target = new File(privateDir(), SO_NAME);
-        if (target == null) return null;
+        File dir = privateDir();
+        if (dir == null) return null;
+        String name = libraryFileName();
+        pruneStaleLibraries(dir, name);
+        File target = new File(dir, name);
         // Reuse an extraction that is newer than the JAR it came from.
         if (target.isFile() && target.length() > 0 && target.lastModified() >= jarFile.lastModified()) {
             return target;
@@ -352,6 +357,40 @@ final class YoutubePoTokenSo {
         File dir = new File(context.getFilesDir(), "catvod_pot");
         if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) return null;
         return dir;
+    }
+
+    /**
+     * Per-ClassLoader library file name.
+     *
+     * <p>A native library can only be opened by one ClassLoader per process. The host builds a new
+     * {@code CspDexClassLoader} whenever it reloads the spider JAR, and the previous loader stays
+     * alive holding the old handle, so opening the same path again fails with
+     * "already opened by ClassLoader ...". The new loader can never bind the symbol, because the
+     * binding belongs to the old one.
+     *
+     * <p>Giving each loader its own copy sidesteps the conflict: a distinct path is a distinct
+     * library as far as the runtime is concerned. The identity hash is stable for the lifetime of
+     * the loader, which is exactly the scope that matters here.
+     */
+    private String libraryFileName() {
+        ClassLoader loader = YoutubePoTokenSo.class.getClassLoader();
+        String tag = loader == null ? "boot" : Integer.toHexString(System.identityHashCode(loader));
+        return "libpot_" + tag + ".so";
+    }
+
+    /** Removes copies left by loaders that are gone, so the directory does not grow. */
+    private void pruneStaleLibraries(File dir, String keep) {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        long cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000;
+        for (File file : files) {
+            String name = file.getName();
+            if (!name.startsWith("libpot_") || !name.endsWith(".so")) continue;
+            if (name.equals(keep)) continue;
+            // Only reap old ones: a sibling loader in this process may still be using a recent copy.
+            if (file.lastModified() < cutoff) //noinspection ResultOfMethodCallIgnored
+                file.delete();
+        }
     }
 
     private static void write(InputStream in, File target) throws java.io.IOException {

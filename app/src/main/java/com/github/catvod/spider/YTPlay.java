@@ -249,7 +249,8 @@ final class YTPlay {
     /**
      * SABR client polling order.
      *
-     * <p>TVHTML5 is the only client used by this full-length SABR path.
+     * <p>Defaults to the client the player response is requested as, since the SABR session and the
+     * poToken are both bound to that identity.
      */
     private List<String> clientPriority() {
         List<String> out = new ArrayList<>();
@@ -265,7 +266,9 @@ final class YTPlay {
                 if (!name.isEmpty() && !out.contains(name)) out.add(name);
             }
         }
-        if (out.isEmpty()) out.add("TVHTML5");
+        // Default to whatever client the player response is requested as, so this list
+        // cannot silently disagree with the identity the poToken is bound to.
+        if (out.isEmpty()) out.add(YoutubePlayer.client(ext));
         return out;
     }
 
@@ -450,7 +453,7 @@ final class YTPlay {
     private SabrData newSabrData(String vid, YouTubeLite.Extracted extracted, String quality, String cacheKey) {
         List<Candidate> candidates = buildCandidates(extracted.sabrFormats, quality);
         if (candidates.isEmpty()) {
-            com.github.catvod.crawler.SpiderDebug.log("YouTube TVHTML5 SABR 候选为空: formats="
+            com.github.catvod.crawler.SpiderDebug.log("YouTube SABR 候选为空: formats="
                     + extracted.sabrFormats.size() + ", quality=" + quality);
             return null;
         }
