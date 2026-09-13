@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - main
+      - sabr-so-offline
     paths:
       - "app/**"
       - "build.gradle"

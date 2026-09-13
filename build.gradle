@@ -41,6 +41,11 @@ def prepareSpiderJar = tasks.register('prepareSpiderJar', Sync) {
     from(decodedDir.map { it.dir('smali/com/github/catvod/spider') }) {
         into 'smali/com/github/catvod/spider'
     }
+    // libpot.so resolves its JNI symbol from this exact class name, so the bridge cannot live
+    // under com.github.catvod.spider and must be packaged from its own tree.
+    from(decodedDir.map { it.dir('smali/app/morphe') }) {
+        into 'smali/app/morphe'
+    }
     into(stagedDir)
 }
 

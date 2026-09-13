@@ -424,7 +424,7 @@ public class YouTube extends Spider {
         String playlistId = YTParse.playlistId(rawId);
         if (!playlistId.isEmpty()) return playlistDetail(playlistId);
         String videoId = rawId.startsWith("v:") ? rawId.substring(2) : rawId;
-        // Detail is metadata-only. Avoid player/BotGuard/related-video work here so a
+        // Detail is metadata-only. Avoid player/poToken/related-video work here so a
         // slow YouTube response cannot consume the host detail timeout.
         String title;
         synchronized (titleCache) {

@@ -74,6 +74,20 @@ try {
     }
     if ($unexpected) { Fail ("unexpected catvod entries: " + (($unexpected.Name | Sort-Object) -join ", ")) }
 
+    # The offline poToken minter binds a JNI symbol derived from its fully qualified class name,
+    # so the bridge must ship as app.morphe.pot.helper.potokens.PoTokenServiceImpl and cannot be
+    # moved under com.github.catvod. Only that one class is allowed outside the catvod tree.
+    $morphe = Join-Path $smali "app\morphe"
+    if (Test-Path -LiteralPath $morphe) {
+        $allowedMorphe = @("PoTokenServiceImpl.smali")
+        $strayMorphe = Get-ChildItem -Recurse -Force -File -LiteralPath $morphe | Where-Object {
+            $_.Name -notin $allowedMorphe
+        }
+        if ($strayMorphe) {
+            Fail ("unexpected app/morphe entries: " + (($strayMorphe.Name | Sort-Object -Unique) -join ", "))
+        }
+    }
+
     $defs = [Collections.Generic.HashSet[string]]::new()
     $refs = [Collections.Generic.HashSet[string]]::new()
     $classPattern = '(?m)^\.class[ \t]+(?:[^ \t\r\n]+[ \t]+)*L([^;\r\n]+);'
@@ -95,6 +109,7 @@ try {
 
     $allowed = @(
         "android/",
+        "app/morphe/pot/helper/potokens/",
         "androidx/annotation/",
         "androidx/startup/",
         "androidx/tracing/",

@@ -120,7 +120,7 @@ class YouTubeLite {
         this.http = http;
         this.headers = headers == null ? new HashMap<>() : headers;
         this.config = config == null ? new JsonObject() : config;
-        // Hand the client to the session so BotGuard's fetches share this spider's proxy.
+        // The offline minter performs no I/O; the client is passed for call-site compatibility.
         this.session = new YoutubeSession(context, this.config, http);
         this.extractCacheTtl = optLong(this.config, "extract_cache_ttl", 300);
     }
@@ -187,7 +187,7 @@ class YouTubeLite {
         if (cached != null && cached.expires > now) {
             // A forced refresh from parallel A/B MPD requests may arrive while another caller has
             // already produced a valid session. Reuse that session instead of starting another
-            // BotGuard/WebView cycle. Empty SABR results are deliberately not cached below.
+            // mint cycle. Empty SABR results are deliberately not cached below.
             if (!forceRefresh || (cached.data != null && !cached.data.sabrFormats.isEmpty())) return cached.data;
         }
 
@@ -282,14 +282,14 @@ class YouTubeLite {
         result.playerUrl = playerUrl;
         extractFormats(responses, playerUrl, result);
         if (result.sabrFormats.isEmpty() && retryToken && visitorData != null) {
-            // BotGuard/WebView can time out once while the visitor binding is still valid. Retry
+            // A mint can fail once while the visitor binding is still valid. Retry
             // the same serialized extraction once with a fresh token before exposing formats=0.
             SpiderDebug.log("YouTube TVHTML5 SABR 为空，重试 visitor-bound poToken: vid=" + videoId);
             session.retryToken();
             return extractLocked(videoId, true, false);
         }
 
-        // Do not cache a transient BotGuard timeout as a valid extraction. A later A/B request
+        // Do not cache a transient mint failure as a valid extraction. A later A/B request
         // should be able to retry with a fresh visitor-bound token instead of returning formats=0.
         if (!result.sabrFormats.isEmpty() || !result.formats.isEmpty()) {
             CacheEntry entry = new CacheEntry();

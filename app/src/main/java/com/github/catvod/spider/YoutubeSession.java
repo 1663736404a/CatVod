@@ -2,16 +2,22 @@ package com.github.catvod.spider;
 
 import com.google.gson.JsonObject;
 
-/** Owns the visitor/token identity for one Spider lifetime. */
+/**
+ * Owns the visitor/token identity for one Spider lifetime.
+ *
+ * <p>The poToken is minted offline by {@link YoutubePoTokenSo}; there is no WebView and no
+ * BotGuard round trip, so binding a visitor costs one native call.
+ */
 final class YoutubeSession {
     final YoutubePoToken poTokens;
-    final YoutubeBotGuard botGuard;
+    final YoutubePoTokenSo poTokenSo;
     String visitorData;
     Integer signatureTimestamp;
     private String cachedBinding;
     private String cachedToken;
     private boolean tokenAttempted;
     private long tokenAttemptAt;
+    /** Short cooldown so one failed mint does not poison a valid visitor binding. */
     private static final long TOKEN_RETRY_MS = 5000L;
 
     YoutubeSession(android.content.Context context, JsonObject config) {
@@ -19,12 +25,12 @@ final class YoutubeSession {
     }
 
     /**
-     * @param http the spider's HTTP client, used to run BotGuard's network calls through the
-     *             configured proxy. WebView cannot use it; see {@link YoutubeBotGuard}.
+     * @param http retained for call-site compatibility; the offline minter performs no I/O.
      */
     YoutubeSession(android.content.Context context, JsonObject config, YTHttp http) {
         poTokens = new YoutubePoToken(config);
-        botGuard = new YoutubeBotGuard(context, poTokens, http);
+        poTokenSo = new YoutubePoTokenSo(context, poTokens,
+                YouTubeLite.optString(config, "pot_so_path", null));
     }
 
     void bind(String visitorData, Integer signatureTimestamp) {
@@ -46,10 +52,7 @@ final class YoutubeSession {
         cachedBinding = visitorData;
         tokenAttempted = true;
         tokenAttemptAt = now;
-        cachedToken = botGuard.token(visitorData);
-        // A transient WebView timeout must not permanently poison this visitor binding. The next
-        // extraction after the short cooldown gets one fresh BotGuard attempt, while concurrent
-        // callers remain serialized by this method's monitor.
+        cachedToken = poTokenSo.token(visitorData);
         return cachedToken;
     }
 

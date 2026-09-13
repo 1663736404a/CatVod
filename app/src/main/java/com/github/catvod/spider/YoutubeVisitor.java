@@ -3,7 +3,7 @@ package com.github.catvod.spider;
 import android.text.TextUtils;
 import com.google.gson.JsonObject;
 
-/** Resolves and validates the visitor identity shared by watch, player and BotGuard. */
+/** Resolves and validates the visitor identity shared by watch, player and the poToken minter. */
 final class YoutubeVisitor {
     private YoutubeVisitor() {}
 

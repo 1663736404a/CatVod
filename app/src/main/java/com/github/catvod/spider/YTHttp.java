@@ -144,9 +144,9 @@ final class YTHttp {
 
     /**
      * Runs an arbitrary request on this client, so callers that are not OkHttp-aware still go
-     * through the configured proxy. Used by the BotGuard fetch bridge.
+     * through the configured proxy.
      *
-     * @param method  HTTP method; only GET and POST are used by BotGuard.
+     * @param method  HTTP method.
      * @param body    request body, or {@code null} for a bodiless request.
      * @throws IOException on a transport failure, so the caller can report it verbatim.
      */

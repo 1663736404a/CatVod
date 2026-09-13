@@ -47,7 +47,7 @@ final class YTPlay {
 
     private final Map<String, SabrData> sabrCache = new HashMap<>();
     // A and B can request the same video MPD concurrently. Serialize extraction per video so
-    // both routes share one successful TVHTML5/poToken response instead of racing BotGuard.
+    // both routes share one successful TVHTML5/poToken response instead of minting twice.
     private final Map<String, Object> sabrExtractLocks = new HashMap<>();
     // A local MPD can outlive the host's current episode during sequential playback.
     // Include a generation in the SABR state key so a new extraction never reuses old UMP state.

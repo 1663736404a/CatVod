@@ -28,3 +28,14 @@
 # QuickJS — YoutubeNsig reaches it by reflection, so names must survive.
 -keeppackagenames com.whl.quickjs.**
 -keep class com.whl.quickjs.** { *; }
+
+# libpot.so offline PoToken.
+# JNI derives the symbol from the fully qualified class name, so this package must survive
+# -repackageclasses untouched, otherwise the native method never binds.
+-keeppackagenames app.morphe.**
+-keep class app.morphe.pot.helper.potokens.PoTokenServiceImpl { *; }
+-keepclasseswithmembernames class * { native <methods>; }
+
+# Proto writer/reader used to build the poToken payload.
+-keep class com.github.catvod.spider.pot.** { *; }
+-keep class com.github.catvod.spider.YoutubePoTokenSo { *; }
