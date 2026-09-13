@@ -63,6 +63,21 @@ try {
     $smali = Join-Path $work "smali"
     if (-not (Test-Path -LiteralPath $smali)) { Fail "missing smali output" }
 
+    # The offline poToken minter is carried inside the JAR, because a JAR gets no
+    # nativeLibraryDir and System.loadLibrary can never resolve for it. apktool restores these
+    # as unknown files, so verify the entries survived the rebuild.
+    $unknownLib = Join-Path $work "unknown\lib"
+    if (-not (Test-Path -LiteralPath $unknownLib)) { Fail "missing packaged lib/ (libpot.so)" }
+    $sos = Get-ChildItem -Recurse -Force -File -LiteralPath $unknownLib -Filter "libpot.so"
+    if (-not $sos) { Fail "missing libpot.so under lib/" }
+    foreach ($so in $sos) {
+        $header = [IO.File]::ReadAllBytes($so.FullName)[0..3]
+        if (($header[0] -ne 0x7F) -or ($header[1] -ne 0x45) -or ($header[2] -ne 0x4C) -or ($header[3] -ne 0x46)) {
+            Fail "not an ELF: $($so.FullName)"
+        }
+    }
+    Write-Host ("OK packaged libpot.so: " + (($sos | ForEach-Object { $_.Directory.Name }) -join ", "))
+
     foreach ($path in @("androidx", "kotlin", "javax\xml\namespace", "org\slf4j", "org\xmlpull\v1")) {
         if (Test-Path -LiteralPath (Join-Path $smali $path)) { Fail "unexpected packaged API: $path" }
     }

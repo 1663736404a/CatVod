@@ -1,6 +1,7 @@
 package com.github.catvod.spider;
 
 import android.content.Context;
+import android.os.Build;
 import android.util.Base64;
 import android.util.Pair;
 
@@ -14,11 +15,19 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.CodeSource;
+import java.security.ProtectionDomain;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
@@ -28,36 +37,33 @@ import javax.crypto.spec.SecretKeySpec;
  * Offline GVS poToken minter backed by Morphe's libpot.so.
  *
  * <p>Replaces the previous WebView route entirely: no network call, no JS engine, no
- * {@code esm.sh} module graph. Startup cost is one {@code dlopen} instead of a WebView
- * plus three YouTube round trips, which is the whole point on low-end TV boxes.
+ * {@code esm.sh} module graph. Startup cost is one {@code dlopen} instead of a WebView plus
+ * three YouTube round trips, which is what made the old path unusable on low-end TV boxes.
  *
- * <h3>Why the library is loaded by path</h3>
- * The spider ships as {@code custom_spider.jar}, which is a bare dex container: the build
- * copies only {@code smali/com/github/catvod/spider} out of the R8 output (see
- * {@code build.gradle::prepareSpiderJar}) and {@code checkJar.ps1} rejects anything else.
- * There is no {@code lib/<abi>/} inside a JAR and no {@code nativeLibraryDir} for it, so
- * {@code System.loadLibrary("pot")} can never resolve. The library is therefore located at
- * runtime, copied into the host's private storage and opened with
- * {@link System#load(String)}.
+ * <h3>Where the library comes from</h3>
+ * The spider ships as {@code custom_spider.jar}, and a JAR gets no {@code nativeLibraryDir}
+ * from the platform, so {@code System.loadLibrary("pot")} can never resolve. The library is
+ * therefore carried inside this JAR under {@code lib/<abi>/libpot.so}, located at runtime by
+ * finding the JAR itself, extracted into the host's private storage and opened with
+ * {@link System#load(String)}. Nothing has to be placed on the device by hand.
  *
- * <p>Resolution order, first hit wins:
- * <ol>
- *   <li>{@code ext.pot_so_path} — absolute path in the site config.</li>
- *   <li>{@code <files>/catvod_pot/libpot.so} and the usual sideload directories.</li>
- *   <li>An installed PoToken Helper package, whose {@code nativeLibraryDir} already holds a
- *       per-ABI {@code libpot.so}.</li>
- * </ol>
+ * <p>{@code ext.pot_so_path} still overrides everything, which is useful for testing a
+ * different build of the library without rebuilding the JAR.
  */
 final class YoutubePoTokenSo {
 
-    /** Package that ships libpot.so per ABI; used only as a library source. */
-    private static final String HELPER_PACKAGE = "app.morphe.pot.helper";
     private static final String SO_NAME = "libpot.so";
+    /** Ships libpot.so per ABI; used only as an additional library source when installed. */
+    private static final String HELPER_PACKAGE = "app.morphe.pot.helper";
+    /** ABIs carried in this JAR, in the order they are worth trying. */
+    private static final String[] ABIS = {"arm64-v8a", "armeabi-v7a", "x86_64", "x86"};
 
     /** dlopen is process-wide, so the outcome is cached for the whole process. */
     private static volatile boolean loaded;
     private static volatile boolean attempted;
     private static volatile String loadedFrom;
+    /** Resolved once; finding the JAR involves reflection and a directory scan. */
+    private static volatile String jarPath;
 
     private final YoutubePoToken configured;
     private final Context context;
@@ -136,31 +142,86 @@ final class YoutubePoTokenSo {
         synchronized (YoutubePoTokenSo.class) {
             if (attempted) return loaded;
             attempted = true;
+            // A library already mapped into this process is enough, whoever loaded it.
+            if (probe()) {
+                loaded = true;
+                loadedFrom = "already-loaded";
+                return true;
+            }
             for (File candidate : candidates()) {
                 if (candidate == null || !candidate.isFile() || candidate.length() == 0) continue;
-                File target = candidate;
-                // dlopen needs the file on a path the host process may map as executable.
-                if (!isPrivate(candidate)) {
-                    target = stage(candidate);
-                    if (target == null) continue;
-                }
-                try {
-                    System.load(target.getAbsolutePath());
-                    loaded = true;
-                    loadedFrom = candidate.getAbsolutePath();
-                    SpiderDebug.log("PoTokenSo: 已加载 " + loadedFrom);
-                    return true;
-                } catch (Throwable error) {
-                    // Usually a foreign ABI; keep trying the remaining candidates.
-                    SpiderDebug.log("PoTokenSo: 加载失败 " + candidate + " " + error);
-                }
+                File target = stagedIfNeeded(candidate);
+                if (target == null) continue;
+                if (open(target, candidate.getAbsolutePath())) return true;
             }
-            SpiderDebug.log("PoTokenSo: 未找到 " + SO_NAME + "，请在 ext 配置 pot_so_path 或安装 " + HELPER_PACKAGE);
+            File extracted = extractFromJar();
+            if (extracted != null && open(extracted, extracted.getAbsolutePath())) return true;
+            SpiderDebug.log("PoTokenSo: 无法加载 " + SO_NAME
+                    + "（JAR 内未找到匹配 ABI，也可在 ext 配置 pot_so_path）");
             return false;
         }
     }
 
-    /** Every place the library may legitimately come from, in priority order. */
+    /** @return true when the library is mapped and its symbol binds. */
+    private boolean open(File file, String origin) {
+        try {
+            System.load(file.getAbsolutePath());
+            loaded = true;
+            loadedFrom = origin;
+            SpiderDebug.log("PoTokenSo: 已加载 " + origin);
+            return true;
+        } catch (Throwable error) {
+            // Loading the same soname twice in one process is reported as an error even though
+            // the library is usable, so treat a bound symbol as success.
+            String message = String.valueOf(error.getMessage());
+            if (message.contains("already opened") && probe()) {
+                loaded = true;
+                loadedFrom = origin + " (already opened)";
+                SpiderDebug.log("PoTokenSo: 已加载（进程内已存在）" + origin);
+                return true;
+            }
+            // Usually a foreign ABI; the caller keeps trying the remaining candidates.
+            SpiderDebug.log("PoTokenSo: 加载失败 " + origin + " " + error);
+            return false;
+        }
+    }
+
+    /**
+     * True when the native method is already bound in this process.
+     *
+     * <p>Deliberately does not call the minter: that would run native code with a challenge
+     * this method did not construct. Only the JNI binding is checked, which is what
+     * distinguishes "the soname is mapped" from "the symbol is missing".
+     */
+    private static boolean probe() {
+        try {
+            java.lang.reflect.Method method = PoTokenServiceImpl.class
+                    .getDeclaredMethod("mintMorpheIntegrityTokens", byte[].class);
+            // Resolving a native method's implementation is what throws when it is unbound.
+            method.setAccessible(true);
+            return java.lang.reflect.Modifier.isNative(method.getModifiers()) && bound(method);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Probes the binding with a zero-length challenge, which the minter treats as empty input
+     * and rejects without doing work. An {@link UnsatisfiedLinkError} means no binding exists.
+     */
+    private static boolean bound(java.lang.reflect.Method method) {
+        try {
+            method.invoke(null, (Object) new byte[0]);
+            return true;
+        } catch (java.lang.reflect.InvocationTargetException error) {
+            // The native code ran and threw, so the symbol is bound.
+            return !(error.getCause() instanceof UnsatisfiedLinkError);
+        } catch (Throwable error) {
+            return !(error instanceof UnsatisfiedLinkError);
+        }
+    }
+
+    /** Library files that may exist outside this JAR, in priority order. */
     private List<File> candidates() {
         List<File> files = new ArrayList<>();
         if (configuredPath != null && !configuredPath.isEmpty()) {
@@ -170,7 +231,6 @@ final class YoutubePoTokenSo {
         }
         if (context != null) {
             files.add(new File(context.getFilesDir(), "catvod_pot/" + SO_NAME));
-            files.add(new File(context.getFilesDir(), SO_NAME));
             File external = context.getExternalFilesDir(null);
             if (external != null) files.add(new File(external, SO_NAME));
             files.addAll(helperLibraries());
@@ -184,52 +244,302 @@ final class YoutubePoTokenSo {
         try {
             android.content.pm.ApplicationInfo info = context.getPackageManager()
                     .getApplicationInfo(HELPER_PACKAGE, 0);
-            if (info.nativeLibraryDir != null) {
-                files.add(new File(info.nativeLibraryDir, SO_NAME));
-            }
+            if (info.nativeLibraryDir != null) files.add(new File(info.nativeLibraryDir, SO_NAME));
         } catch (Throwable ignored) {
-            // Helper not installed; the configured paths remain the only source.
+            // Helper not installed; the JAR remains the source.
         }
         return files;
     }
 
-    private boolean isPrivate(File file) {
-        if (context == null) return false;
-        String path = file.getAbsolutePath();
+    /**
+     * Copies a library into private storage when it is not already somewhere the host may map
+     * as executable.
+     */
+    private File stagedIfNeeded(File source) {
+        if (context == null) return source;
+        String path = source.getAbsolutePath();
         File dir = context.getFilesDir();
-        if (dir != null && path.startsWith(dir.getAbsolutePath())) return true;
+        if (dir != null && path.startsWith(dir.getAbsolutePath())) return source;
         // A helper's nativeLibraryDir is already extracted and executable.
-        return loadedFromHelper(path);
+        if (path.contains("/" + HELPER_PACKAGE + "-") || path.contains("/" + HELPER_PACKAGE + "/")) {
+            return source;
+        }
+        return stage(source);
     }
 
-    private boolean loadedFromHelper(String path) {
-        return path.contains("/" + HELPER_PACKAGE + "-") || path.contains("/" + HELPER_PACKAGE + "/");
-    }
-
-    /** Copies the library into private storage so it can be mapped executable. */
     private File stage(File source) {
-        if (context == null) return null;
         try {
-            File dir = new File(context.getFilesDir(), "catvod_pot");
-            if (!dir.isDirectory() && !dir.mkdirs()) return null;
-            File target = new File(dir, SO_NAME);
+            File target = new File(privateDir(), SO_NAME);
+            if (target == null) return null;
             // Re-copy whenever the source changed, so replacing the file takes effect.
             if (target.isFile() && target.length() == source.length()
                     && target.lastModified() >= source.lastModified()) {
                 return target;
             }
-            try (InputStream in = new java.io.FileInputStream(source);
-                 OutputStream out = new FileOutputStream(target)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+            try (InputStream in = new java.io.FileInputStream(source)) {
+                write(in, target);
             }
-            //noinspection ResultOfMethodCallIgnored
-            target.setReadable(true, true);
             return target;
         } catch (Throwable error) {
             SpiderDebug.log("PoTokenSo: 复制 so 失败 " + error);
             return null;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* extraction from this JAR                                           */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Extracts {@code lib/<abi>/libpot.so} out of this JAR.
+     *
+     * <p>The device ABI is tried first; the remaining ones follow, because an emulator or a
+     * 32-bit host process can report an ABI list this JAR does not carry verbatim.
+     */
+    private File extractFromJar() {
+        if (context == null) return null;
+        String jar = jar();
+        if (jar == null) {
+            SpiderDebug.log("PoTokenSo: 未能定位自身 JAR");
+            return null;
+        }
+        File jarFile = new File(jar);
+        if (!jarFile.isFile()) return null;
+        File target = new File(privateDir(), SO_NAME);
+        if (target == null) return null;
+        // Reuse an extraction that is newer than the JAR it came from.
+        if (target.isFile() && target.length() > 0 && target.lastModified() >= jarFile.lastModified()) {
+            return target;
+        }
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(jar);
+            for (String abi : abis()) {
+                ZipEntry entry = zip.getEntry("lib/" + abi + "/" + SO_NAME);
+                if (entry == null) continue;
+                try (InputStream in = zip.getInputStream(entry)) {
+                    write(in, target);
+                }
+                SpiderDebug.log("PoTokenSo: 已从 JAR 解压 lib/" + abi + "/" + SO_NAME);
+                return target;
+            }
+            SpiderDebug.log("PoTokenSo: JAR 内无 lib/<abi>/" + SO_NAME);
+            return null;
+        } catch (Throwable error) {
+            SpiderDebug.log("PoTokenSo: 解压失败 " + error);
+            return null;
+        } finally {
+            if (zip != null) try { zip.close(); } catch (Throwable ignored) { }
+        }
+    }
+
+    /** Device ABIs first, then the rest of the ABIs this JAR carries. */
+    private static List<String> abis() {
+        Set<String> out = new LinkedHashSet<>();
+        try {
+            String[] supported = Build.SUPPORTED_ABIS;
+            if (supported != null) for (String abi : supported) if (abi != null) out.add(abi);
+        } catch (Throwable ignored) {
+            // Fall back to the packaged order.
+        }
+        for (String abi : ABIS) out.add(abi);
+        return new ArrayList<>(out);
+    }
+
+    private File privateDir() {
+        File dir = new File(context.getFilesDir(), "catvod_pot");
+        if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) return null;
+        return dir;
+    }
+
+    private static void write(InputStream in, File target) throws java.io.IOException {
+        File temp = new File(target.getAbsolutePath() + ".tmp");
+        try (OutputStream out = new FileOutputStream(temp)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+        }
+        // Replace atomically, so a half-written library is never opened.
+        if (target.exists()) //noinspection ResultOfMethodCallIgnored
+            target.delete();
+        if (!temp.renameTo(target)) throw new java.io.IOException("rename failed: " + temp);
+        //noinspection ResultOfMethodCallIgnored
+        target.setReadable(true, true);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* locating this JAR                                                  */
+    /* ------------------------------------------------------------------ */
+
+    private String jar() {
+        String cached = jarPath;
+        if (cached != null) return cached.isEmpty() ? null : cached;
+        String found = fromProtectionDomain();
+        if (found == null) found = fromClassLoader();
+        if (found == null) found = fromCommonPaths();
+        jarPath = found == null ? "" : found;
+        if (found != null) SpiderDebug.log("PoTokenSo: JAR 位置 " + found);
+        return found;
+    }
+
+    /** The most direct route: the loader records where the code came from. */
+    private String fromProtectionDomain() {
+        try {
+            ProtectionDomain domain = YoutubePoTokenSo.class.getProtectionDomain();
+            CodeSource source = domain == null ? null : domain.getCodeSource();
+            java.net.URL location = source == null ? null : source.getLocation();
+            if (location == null) return null;
+            String path = location.getPath();
+            if (path == null) return null;
+            int bang = path.indexOf('!');
+            if (bang > 0) path = path.substring(0, bang);
+            if (path.startsWith("file:")) path = path.substring(5);
+            return usable(new File(path)) ? path : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Reads the DexPathList of the loader that defined this class.
+     *
+     * <p>Hosts load the spider through their own DexClassLoader, so the JAR path is reachable
+     * through {@code pathList.dexElements[i].path/zip/dexFile}. Field names differ across API
+     * levels, hence the reflective walk rather than a fixed path.
+     */
+    private String fromClassLoader() {
+        try {
+            ClassLoader loader = YoutubePoTokenSo.class.getClassLoader();
+            while (loader != null) {
+                String found = fromLoader(loader);
+                if (found != null) return found;
+                loader = loader.getParent();
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the directory scan.
+        }
+        return null;
+    }
+
+    private String fromLoader(ClassLoader loader) {
+        try {
+            Field pathListField = field(loader.getClass(), "pathList");
+            if (pathListField == null) return null;
+            pathListField.setAccessible(true);
+            Object pathList = pathListField.get(loader);
+            if (pathList == null) return null;
+            Field elementsField = field(pathList.getClass(), "dexElements");
+            if (elementsField == null) return null;
+            elementsField.setAccessible(true);
+            Object elements = elementsField.get(pathList);
+            if (!(elements instanceof Object[])) return null;
+            for (Object element : (Object[]) elements) {
+                String found = fromElement(element);
+                if (found != null) return found;
+            }
+        } catch (Throwable ignored) {
+            // Not a PathClassLoader, or the fields moved; the caller tries the parent.
+        }
+        return null;
+    }
+
+    private String fromElement(Object element) {
+        if (element == null) return null;
+        for (String name : new String[]{"path", "zip", "dexFile"}) {
+            try {
+                Field f = field(element.getClass(), name);
+                if (f == null) continue;
+                f.setAccessible(true);
+                Object value = f.get(element);
+                if (value == null) continue;
+                String path = null;
+                if (value instanceof File) {
+                    path = ((File) value).getAbsolutePath();
+                } else {
+                    // DexFile keeps the source name behind a getter-like field.
+                    Field nameField = field(value.getClass(), "mFileName");
+                    if (nameField != null) {
+                        nameField.setAccessible(true);
+                        Object fileName = nameField.get(value);
+                        if (fileName != null) path = String.valueOf(fileName);
+                    }
+                }
+                if (path != null && usable(new File(path))) return path;
+            } catch (Throwable ignored) {
+                // Try the next field.
+            }
+        }
+        return null;
+    }
+
+    private static Field field(Class<?> type, String name) {
+        Class<?> current = type;
+        while (current != null) {
+            try {
+                return current.getDeclaredField(name);
+            } catch (NoSuchFieldException error) {
+                current = current.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    /** Last resort: scan the directories a host keeps downloaded spider JARs in. */
+    private String fromCommonPaths() {
+        if (context == null) return null;
+        List<File> roots = new ArrayList<>();
+        roots.add(context.getFilesDir());
+        roots.add(context.getCacheDir());
+        File external = context.getExternalFilesDir(null);
+        if (external != null) roots.add(external);
+        File externalCache = context.getExternalCacheDir();
+        if (externalCache != null) roots.add(externalCache);
+        for (File root : roots) {
+            String found = scan(root, 0);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /** Bounded depth-first scan for a JAR that carries the library. */
+    private String scan(File dir, int depth) {
+        if (dir == null || depth > 2 || !dir.isDirectory()) return null;
+        File[] children = dir.listFiles();
+        if (children == null) return null;
+        List<File> dirs = new ArrayList<>();
+        for (File child : children) {
+            if (child.isDirectory()) {
+                dirs.add(child);
+                continue;
+            }
+            String name = child.getName().toLowerCase(java.util.Locale.ROOT);
+            if ((name.endsWith(".jar") || name.endsWith(".dex")) && usable(child)) {
+                return child.getAbsolutePath();
+            }
+        }
+        for (File child : dirs) {
+            String found = scan(child, depth + 1);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /** True when the archive actually contains the library, so a wrong JAR is not picked. */
+    private static boolean usable(File file) {
+        if (file == null || !file.isFile() || file.length() == 0) return false;
+        ZipFile zip = null;
+        try {
+            zip = new ZipFile(file);
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                String name = entries.nextElement().getName();
+                if (name.startsWith("lib/") && name.endsWith("/" + SO_NAME)) return true;
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            if (zip != null) try { zip.close(); } catch (Throwable ignored) { }
         }
     }
 
@@ -275,14 +585,7 @@ final class YoutubePoTokenSo {
      * not established from public source. The library decodes them with nanopb into its
      * {@code Challenge} message, and the visitor binding is what the GVS token must be tied to,
      * so the identifier is passed as field 1. If a build turns out to need the original proto,
-     * capture one real call and return those bytes here instead:
-     *
-     * <pre>
-     * frida -U -n com.google.android.youtube -e '
-     *   Interceptor.attach(Module.findExportByName("libpot.so",
-     *     "Java_app_morphe_pot_helper_potokens_PoTokenServiceImpl_mintMorpheIntegrityTokens"),
-     *     { onEnter(a) { /* dump the jbyteArray at a[2] */ } });'
-     * </pre>
+     * capture one real call and return those bytes here instead; see docs/potoken-so.md.
      */
     private static byte[] buildChallenge(String visitorData) {
         byte[] identifier = visitorData.getBytes(StandardCharsets.UTF_8);
@@ -318,5 +621,4 @@ final class YoutubePoTokenSo {
         }
         return out.toByteArray();
     }
-
 }

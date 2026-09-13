@@ -8,6 +8,10 @@ sdkInfo: null
 sharedLibrary: false
 sparseResources: false
 unknownFiles:
+  lib/arm64-v8a/libpot.so: 8
+  lib/armeabi-v7a/libpot.so: 8
+  lib/x86/libpot.so: 8
+  lib/x86_64/libpot.so: 8
 usesFramework: null
 version: 2.11.0
 versionInfo: null
