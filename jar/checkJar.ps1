@@ -42,6 +42,10 @@ function StartsWithAny([string] $Value, [string[]] $Prefixes) {
     return $false
 }
 
+# ZipFile lives in System.IO.Compression.FileSystem, which PowerShell 5.1 does not load by
+# default. PowerShell 7 has it built in; Add-Type is a no-op there.
+try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+
 $apktool = Join-Path $PSScriptRoot "3rd\apktool_2.11.0.jar"
 if (-not (Test-Path -LiteralPath $Jar)) { Fail "missing jar: $Jar" }
 if (-not (Test-Path -LiteralPath $apktool)) { Fail "missing apktool: $apktool" }
@@ -64,19 +68,36 @@ try {
     if (-not (Test-Path -LiteralPath $smali)) { Fail "missing smali output" }
 
     # The offline poToken minter is carried inside the JAR, because a JAR gets no
-    # nativeLibraryDir and System.loadLibrary can never resolve for it. apktool restores these
-    # as unknown files, so verify the entries survived the rebuild.
-    $unknownLib = Join-Path $work "unknown\lib"
-    if (-not (Test-Path -LiteralPath $unknownLib)) { Fail "missing packaged lib/ (libpot.so)" }
-    $sos = Get-ChildItem -Recurse -Force -File -LiteralPath $unknownLib -Filter "libpot.so"
-    if (-not $sos) { Fail "missing libpot.so under lib/" }
-    foreach ($so in $sos) {
-        $header = [IO.File]::ReadAllBytes($so.FullName)[0..3]
-        if (($header[0] -ne 0x7F) -or ($header[1] -ne 0x45) -or ($header[2] -ne 0x4C) -or ($header[3] -ne 0x46)) {
-            Fail "not an ELF: $($so.FullName)"
+    # nativeLibraryDir and System.loadLibrary can never resolve for it. Read the ZIP directly
+    # rather than the decoded tree: apktool places lib/ under different roots depending on how
+    # it classified the entries, and what matters is the shipped archive.
+    # Fail exits the process, so gather the verdict first and release the archive before
+    # reporting: exiting from inside the try block would leave the ZIP handle open.
+    $abis = @()
+    $badElf = $null
+    $zip = [IO.Compression.ZipFile]::OpenRead($Jar)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ($entry.FullName -notlike "lib/*/libpot.so") { continue }
+            $abis += $entry.FullName.Split("/")[1]
+            $stream = $entry.Open()
+            try {
+                $header = New-Object byte[] 4
+                $read = $stream.Read($header, 0, 4)
+                if ($read -ne 4 -or $header[0] -ne 0x7F -or $header[1] -ne 0x45 `
+                        -or $header[2] -ne 0x4C -or $header[3] -ne 0x46) {
+                    if (-not $badElf) { $badElf = $entry.FullName }
+                }
+            } finally {
+                $stream.Dispose()
+            }
         }
+    } finally {
+        $zip.Dispose()
     }
-    Write-Host ("OK packaged libpot.so: " + (($sos | ForEach-Object { $_.Directory.Name }) -join ", "))
+    if (-not $abis) { Fail "missing lib/<abi>/libpot.so in jar" }
+    if ($badElf) { Fail "not an ELF: $badElf" }
+    Write-Host ("OK packaged libpot.so: " + (($abis | Sort-Object) -join ", "))
 
     foreach ($path in @("androidx", "kotlin", "javax\xml\namespace", "org\slf4j", "org\xmlpull\v1")) {
         if (Test-Path -LiteralPath (Join-Path $smali $path)) { Fail "unexpected packaged API: $path" }
