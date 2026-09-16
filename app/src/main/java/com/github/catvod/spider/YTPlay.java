@@ -709,9 +709,8 @@ final class YTPlay {
      * fallback route when the SABR bridge misbehaves, and it only works when the player response
      * contains URL-bearing formats (the SABR-only responses have none).
      *
-     * <p>Only mp4 (H.264/AAC) representations are published by default: every device can decode
-     * them and SegmentBase indexing is a plain sidx. Webm is used only when the response has no
-     * mp4 at all.
+     * <p>Codec selection: AV1 representations are skipped (common devices decode it poorly);
+     * H.264 mp4 and VP9 webm are published together so 1440p/4K stays reachable through VP9.
      */
     private Object[] proxyDashMpd(Map<String, String> params) {
         String vid = params.get("vid");
@@ -753,7 +752,13 @@ final class YTPlay {
         return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
     }
 
-    /** Direct URL + init/index range are all mandatory for a SegmentBase representation. */
+    /**
+     * Direct URL + init/index range are all mandatory for a SegmentBase representation.
+     *
+     * <p>AV1 is excluded outright — common TV boxes struggle to decode it. Both H.264 (mp4) and
+     * VP9 (webm) representations are published together: VP9 covers the 1440p+/4K rungs H.264
+     * never had, so filtering to mp4 alone would cap the route at 1080p.
+     */
     private List<YTFormat> directVideos(List<YTFormat> formats, String quality) {
         Set<Integer> bad = skipItags();
         List<YTFormat> usable = new ArrayList<>();
@@ -762,14 +767,16 @@ final class YTPlay {
             if (TextUtils.isEmpty(item.url) || item.initRange == null || item.indexRange == null) continue;
             if (item.height <= 0) continue;
             if (bad.contains(item.itag)) continue;
+            String codecs = low(item.codecs);
+            String mime = low(mimeBase(item.mimeType));
+            if (codecs.contains("av01") || codecs.contains("av1") || mime.contains("av01")) continue;
             usable.add(item);
         }
-        List<YTFormat> mp4 = new ArrayList<>();
-        for (YTFormat item : usable) if (low(mimeBase(item.mimeType)).contains("mp4")) mp4.add(item);
-        List<YTFormat> picked = mp4.isEmpty() ? usable : mp4;
-        picked = heightBucket(picked, quality);
+        List<YTFormat> picked = heightBucket(usable, quality);
         picked.sort((a, b) -> {
             int cmp = Integer.compare(b.height, a.height);
+            if (cmp != 0) return cmp;
+            cmp = Integer.compare(yt.videoCodecPriority(b), yt.videoCodecPriority(a));
             if (cmp != 0) return cmp;
             return Long.compare(b.bitrate, a.bitrate);
         });
@@ -814,11 +821,12 @@ final class YTPlay {
         StringBuilder sb = new StringBuilder();
         sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2)
                 .append("\" contentType=\"").append(track)
-                .append("\" mimeType=\"").append(video ? "video/mp4" : "audio/mp4")
                 .append("\" segmentAlignment=\"true\" startWithSAP=\"1\"")
                 .append(" subsegmentAlignment=\"true\" subsegmentStartsWithSAP=\"1\">\n");
         for (YTFormat item : items) {
+            String mime = fallback(mimeBase(item.mimeType), video ? "video/mp4" : "audio/mp4");
             sb.append("      <Representation id=\"dash-").append(video ? "v" : "a").append(item.itag)
+                    .append("\" mimeType=\"").append(esc(mime))
                     .append("\" bandwidth=\"")
                     .append(item.bitrate > 0 ? item.bitrate : (video ? 1000000 : 128000))
                     .append("\" codecs=\"").append(esc(item.codecs)).append("\"");

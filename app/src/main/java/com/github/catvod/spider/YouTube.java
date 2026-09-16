@@ -439,12 +439,13 @@ public class YouTube extends Spider {
             }
         }
         String safeTitle = YTParse.safeTitle(title);
-        // Two routes for the same episode: the SABR bridge (default) and a plain DASH manifest
-        // built from the player response's direct formats. flag arrives in playerContent().
+        // Two routes for the same episode: a plain DASH manifest built from the player response's
+        // direct formats, and the SABR bridge. 普通DASH first: no SABR session involved, the most
+        // robust path; flag arrives in playerContent().
         List<String> playFrom = new ArrayList<>();
         List<String> playUrl = new ArrayList<>();
-        playFrom.add("SABR");
         playFrom.add("普通DASH");
+        playFrom.add("SABR");
         playUrl.add(safeTitle + "$" + videoId);
         playUrl.add(safeTitle + "$" + videoId);
         Vod vod = new Vod();
@@ -743,7 +744,7 @@ public class YouTube extends Spider {
         vod.setVodPic(pic(playlist.pic.isEmpty() ? videos.get(0).pic : playlist.pic));
         vod.setVodRemarks(videos.size() + " videos");
         vod.setVodContent(TextUtils.join("\n", content));
-        vod.setVodPlayFrom("SABR$$$普通DASH");
+        vod.setVodPlayFrom("普通DASH$$$SABR");
         String episodesStr = TextUtils.join("#", episodes);
         vod.setVodPlayUrl(episodesStr + "$$$" + episodesStr);
         return Result.string(vod);
