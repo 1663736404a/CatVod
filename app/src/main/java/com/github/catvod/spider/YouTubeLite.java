@@ -510,6 +510,14 @@ class YouTubeLite {
         }
         if (TextUtils.isEmpty(mediaUrl)) return null;
         mediaUrl = syncNParam(mediaUrl);
+        // Direct URLs carry the n challenge too: an unsolved n throttles the stream to a
+        // trickle. The SABR path solves its serverAbrStreamingUrl in extractFormats; do the same
+        // here so plain-DASH segments download at full speed. Failure keeps the original URL.
+        if (YoutubeNsig.needsSolve(mediaUrl)) {
+            String rawN = Uri.parse(mediaUrl).getQueryParameter("n");
+            String solvedN = YoutubeNsig.solve(playerCode(playerUrl), rawN);
+            if (!TextUtils.isEmpty(solvedN)) mediaUrl = YoutubeNsig.replace(mediaUrl, solvedN);
+        }
         String token = clientName == null ? null : poToken(clientName);
         if (!TextUtils.isEmpty(token)) {
             mediaUrl = mediaUrl + (mediaUrl.contains("?") ? "&" : "?") + "pot=" + Uri.encode(token);

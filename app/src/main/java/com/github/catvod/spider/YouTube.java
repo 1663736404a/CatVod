@@ -439,9 +439,13 @@ public class YouTube extends Spider {
             }
         }
         String safeTitle = YTParse.safeTitle(title);
+        // Two routes for the same episode: the SABR bridge (default) and a plain DASH manifest
+        // built from the player response's direct formats. flag arrives in playerContent().
         List<String> playFrom = new ArrayList<>();
         List<String> playUrl = new ArrayList<>();
-        playFrom.add("Youtube");
+        playFrom.add("SABR");
+        playFrom.add("普通DASH");
+        playUrl.add(safeTitle + "$" + videoId);
         playUrl.add(safeTitle + "$" + videoId);
         Vod vod = new Vod();
         vod.setVodId(videoId);
@@ -453,11 +457,16 @@ public class YouTube extends Spider {
     }
 
     /**
-     * Starts playback through the JAR-owned SABR bridge.
+     * Starts playback through the selected route.
      *
-     * <p>The player receives one local DASH manifest whose segment requests return to
-     * {@link #proxy(Map)}, where {@link YTPlay} answers them from a SABR session using the
-     * micro-window scheme.
+     * <p>Two routes exist, chosen by the play-from flag the host passes back: {@code SABR}
+     * (default, JAR-owned bridge) and {@code 普通DASH} (a local manifest whose SegmentBase points
+     * straight at the direct formats from the player response — no SABR session involved).
+     *
+     * <p>Live streams take a third route regardless of the flag: the SABR micro-window manifest is
+     * built from a static duration, and a live video reports none (lengthSeconds 0), so the
+     * manifest collapses to one second of content and the player stops right after starting. The
+     * player response carries {@code hlsManifestUrl} for live content, which plays directly.
      */
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) {
@@ -468,18 +477,50 @@ public class YouTube extends Spider {
         if (at > 0) videoId = rawPid.substring(0, at);
         String quality = YouTubeLite.optString(ext, "quality", "best");
         String sid = String.valueOf(playbackGeneration.incrementAndGet());
+        // Live detection needs the player response, so extract here (cached by YouTubeLite, the
+        // SABR path reuses the same entry afterwards instead of extracting twice).
+        try {
+            YouTubeLite.Extracted extracted = yt.extract(videoId, false);
+            if (extracted != null && extracted.isLive) {
+                SpiderDebug.log("YouTube 直播检测命中: vid=" + videoId
+                        + ", hls=" + (extracted.hlsUrl.isEmpty() ? "无" : "有"));
+                return liveResult(extracted);
+            }
+        } catch (Throwable e) {
+            // Detection must not block the normal path; SABR will surface the real error itself.
+            SpiderDebug.log("YouTube 直播检测失败, 按普通视频继续: vid=" + videoId
+                    + ", error=" + String.valueOf(e));
+        }
         // The top-level manifest URL deliberately stays on the host's proxy:// scheme. Handing the
         // host a raw http://127.0.0.1 URL makes it classify playback as EXTERNAL_LOOPBACK_PROXY
         // ("evidence=unregistered-loopback-port") and run a blocking readiness probe before every
         // prepare, which cannot succeed for a port the host does not own: observed 25 attempts /
         // 5067ms of dead time on each attempt. proxy:// is classified as route=OTHER with no gate.
         //
-        // Segment URLs inside the manifest are a different matter and do use the JAR-owned server
-        // (see YTPlay.localUrl): they are what must survive the host's jar-loader clear, and they
-        // are fetched by the player directly without going through that readiness gate.
-        String params = "&type=sabr_mpd&vid=" + Uri.encode(videoId)
+        // Segment URLs inside the manifest differ per route: the SABR route keeps them on the
+        // JAR-owned server (see YTPlay.localUrl), while 普通DASH points its SegmentBase straight at
+        // googlevideo so the player fetches media without any proxy hop.
+        boolean dash = flag != null && flag.contains("DASH");
+        String params = "&type=" + (dash ? "dash_mpd" : "sabr_mpd")
+                + "&vid=" + Uri.encode(videoId)
                 + "&quality=" + Uri.encode(quality) + "&sid=" + sid;
         return Result.get().url(Proxy.getUrl(siteKey, params)).dash().string();
+    }
+
+    /**
+     * Playback result for a live stream: HLS when available, otherwise YouTube's own live DASH
+     * manifest. Both are served by googlevideo directly; only a UA header is required.
+     */
+    private String liveResult(YouTubeLite.Extracted extracted) {
+        Map<String, String> header = new HashMap<>();
+        header.put("User-Agent", YoutubePlayer.userAgent(ext));
+        if (!TextUtils.isEmpty(extracted.hlsUrl)) {
+            return Result.get().url(extracted.hlsUrl).header(header).m3u8().string();
+        }
+        if (!TextUtils.isEmpty(extracted.dashUrl)) {
+            return Result.get().url(extracted.dashUrl).header(header).dash().string();
+        }
+        return Result.get().msg("直播尚未提供可用的播放地址，请稍后重试").string();
     }
 
     @Override
@@ -702,8 +743,9 @@ public class YouTube extends Spider {
         vod.setVodPic(pic(playlist.pic.isEmpty() ? videos.get(0).pic : playlist.pic));
         vod.setVodRemarks(videos.size() + " videos");
         vod.setVodContent(TextUtils.join("\n", content));
-        vod.setVodPlayFrom("YouTube自动");
-        vod.setVodPlayUrl(TextUtils.join("#", episodes));
+        vod.setVodPlayFrom("SABR$$$普通DASH");
+        String episodesStr = TextUtils.join("#", episodes);
+        vod.setVodPlayUrl(episodesStr + "$$$" + episodesStr);
         return Result.string(vod);
     }
 

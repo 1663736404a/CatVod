@@ -181,6 +181,8 @@ final class YTPlay {
         switch (type) {
             case "sabr_mpd":
                 return proxySabrMpd(params);
+            case "dash_mpd":
+                return proxyDashMpd(params);
             case "sabr_time":
                 return proxySabrTime(params);
             default:
@@ -691,6 +693,150 @@ final class YTPlay {
                 .append("</SegmentTimeline>\n")
                 .append("        </SegmentTemplate>\n      </Representation>\n")
                 .append("    </AdaptationSet>\n");
+        return sb.toString();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* plain DASH manifest                                                */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Publishes a conventional static DASH manifest built from the direct formats.
+     *
+     * <p>Each representation keeps its real googlevideo URL and declares {@code SegmentBase} with
+     * the init/index ranges the player response already carries, so the player fetches every
+     * segment straight from googlevideo — no SABR session, no local segment proxy. This is the
+     * fallback route when the SABR bridge misbehaves, and it only works when the player response
+     * contains URL-bearing formats (the SABR-only responses have none).
+     *
+     * <p>Only mp4 (H.264/AAC) representations are published by default: every device can decode
+     * them and SegmentBase indexing is a plain sidx. Webm is used only when the response has no
+     * mp4 at all.
+     */
+    private Object[] proxyDashMpd(Map<String, String> params) {
+        String vid = params.get("vid");
+        String quality = params.get("quality") == null ? "best" : params.get("quality");
+        if (TextUtils.isEmpty(vid)) return text(404, "普通DASH 缺少视频 ID");
+        YouTubeLite.Extracted extracted;
+        try {
+            // Cached extraction; the live check in playerContent usually warmed it already.
+            extracted = yt.extract(vid, false);
+        } catch (Throwable e) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube 普通DASH 提取失败: vid=" + vid
+                    + ", error=" + String.valueOf(e));
+            return text(404, "普通DASH 提取失败: " + e);
+        }
+        List<YTFormat> videos = directVideos(extracted.formats, quality);
+        List<YTFormat> audios = directAudios(extracted.formats);
+        if (videos.isEmpty() || audios.isEmpty()) {
+            com.github.catvod.crawler.SpiderDebug.log("YouTube 普通DASH 无直链格式: vid=" + vid
+                    + ", video=" + videos.size() + ", audio=" + audios.size());
+            return text(404, "普通DASH 无可用直链格式(video=" + videos.size()
+                    + ", audio=" + audios.size() + ")，请改用 SABR 线路");
+        }
+        StringBuilder mpd = new StringBuilder();
+        mpd.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+                .append("<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" ")
+                .append("profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"");
+        if (extracted.duration > 0) {
+            mpd.append(" mediaPresentationDuration=\"PT").append(extracted.duration).append("S\"");
+        }
+        mpd.append(" minBufferTime=\"PT1.5S\">\n")
+                .append("  <Period id=\"1\" start=\"PT0S\">\n")
+                .append(directSet(videos, "video", true))
+                .append(directSet(audios, "audio", false))
+                .append("  </Period>\n</MPD>");
+        com.github.catvod.crawler.SpiderDebug.log("YouTube 普通DASH MPD: vid=" + vid
+                + ", quality=" + quality
+                + ", video数=" + videos.size() + ", audio数=" + audios.size()
+                + ", 时长=" + extracted.duration + "s");
+        return bytes(200, "application/dash+xml", mpd.toString().getBytes(), null);
+    }
+
+    /** Direct URL + init/index range are all mandatory for a SegmentBase representation. */
+    private List<YTFormat> directVideos(List<YTFormat> formats, String quality) {
+        Set<Integer> bad = skipItags();
+        List<YTFormat> usable = new ArrayList<>();
+        for (YTFormat item : formats) {
+            if (!item.hasVideo() || item.hasAudio()) continue;
+            if (TextUtils.isEmpty(item.url) || item.initRange == null || item.indexRange == null) continue;
+            if (item.height <= 0) continue;
+            if (bad.contains(item.itag)) continue;
+            usable.add(item);
+        }
+        List<YTFormat> mp4 = new ArrayList<>();
+        for (YTFormat item : usable) if (low(mimeBase(item.mimeType)).contains("mp4")) mp4.add(item);
+        List<YTFormat> picked = mp4.isEmpty() ? usable : mp4;
+        picked = heightBucket(picked, quality);
+        picked.sort((a, b) -> {
+            int cmp = Integer.compare(b.height, a.height);
+            if (cmp != 0) return cmp;
+            return Long.compare(b.bitrate, a.bitrate);
+        });
+        return picked;
+    }
+
+    private List<YTFormat> directAudios(List<YTFormat> formats) {
+        List<YTFormat> usable = new ArrayList<>();
+        for (YTFormat item : formats) {
+            if (item.hasVideo() || !item.hasAudio()) continue;
+            if (TextUtils.isEmpty(item.url) || item.initRange == null || item.indexRange == null) continue;
+            usable.add(item);
+        }
+        List<YTFormat> mp4 = new ArrayList<>();
+        for (YTFormat item : usable) if (low(mimeBase(item.mimeType)).contains("mp4")) mp4.add(item);
+        List<YTFormat> picked = mp4.isEmpty() ? usable : mp4;
+        picked.sort((a, b) -> Long.compare(b.bitrate, a.bitrate));
+        return picked;
+    }
+
+    /** Same quality buckets the SABR route uses; {@code best} caps at 4K. */
+    private static List<YTFormat> heightBucket(List<YTFormat> items, String quality) {
+        List<YTFormat> out;
+        if ("8k".equals(quality) || "8k_hdr".equals(quality)) {
+            out = heights(items, 4320, Integer.MAX_VALUE);
+        } else if ("4k".equals(quality)) {
+            out = heights(items, 2160, 4320);
+        } else if ("2k".equals(quality)) {
+            out = heights(items, 1440, 2160);
+        } else if ("1080p".equals(quality)) {
+            out = heights(items, 1000, 1440);
+        } else {
+            out = heights(items, 0, 2161);
+            if (out.isEmpty()) out = items;
+            return out;
+        }
+        return out.isEmpty() ? items : out;
+    }
+
+    /** One AdaptationSet of SegmentBase representations pointing at absolute googlevideo URLs. */
+    private String directSet(List<YTFormat> items, String track, boolean video) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("    <AdaptationSet id=\"").append(video ? 1 : 2)
+                .append("\" contentType=\"").append(track)
+                .append("\" mimeType=\"").append(video ? "video/mp4" : "audio/mp4")
+                .append("\" segmentAlignment=\"true\" startWithSAP=\"1\"")
+                .append(" subsegmentAlignment=\"true\" subsegmentStartsWithSAP=\"1\">\n");
+        for (YTFormat item : items) {
+            sb.append("      <Representation id=\"dash-").append(video ? "v" : "a").append(item.itag)
+                    .append("\" bandwidth=\"")
+                    .append(item.bitrate > 0 ? item.bitrate : (video ? 1000000 : 128000))
+                    .append("\" codecs=\"").append(esc(item.codecs)).append("\"");
+            if (video) {
+                sb.append(" width=\"").append(item.width).append("\"")
+                        .append(" height=\"").append(item.height).append("\"")
+                        .append(" fps=\"").append(item.fps > 0 ? item.fps : 30).append("\"");
+            }
+            sb.append(">\n")
+                    .append("        <BaseURL>").append(esc(item.url)).append("</BaseURL>\n")
+                    .append("        <SegmentBase indexRange=\"")
+                    .append(item.indexRange[0]).append("-").append(item.indexRange[1]).append("\">\n")
+                    .append("          <Initialization range=\"")
+                    .append(item.initRange[0]).append("-").append(item.initRange[1]).append("\"/>\n")
+                    .append("        </SegmentBase>\n")
+                    .append("      </Representation>\n");
+        }
+        sb.append("    </AdaptationSet>\n");
         return sb.toString();
     }
 
